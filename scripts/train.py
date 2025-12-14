@@ -247,6 +247,10 @@ def set_seed(seed: int):
 def main():
     args = parse_args()
     
+    # 验证混合精度配置
+    if args.fp16 and args.bf16:
+        raise ValueError("Cannot use both --fp16 and --bf16 at the same time. Please choose one.")
+    
     # 设置分布式
     rank, world_size, local_rank = setup_distributed()
     is_distributed = rank is not None

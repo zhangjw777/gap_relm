@@ -492,6 +492,12 @@ class GapReLMTrainer:
             insert_preds
         )
         
+        # 检查模板构建结果是否成功
+        if template_result is None or template_result.template_ids is None:
+            # 模板构建失败，保持使用原始模板（Gold Template）
+            logger.warning("Template building failed in scheduled sampling, using original template")
+            return batch
+        
         # 更新 batch
         batch['template_input_ids'] = template_result.template_ids
         batch['template_attention_mask'] = template_result.template_mask

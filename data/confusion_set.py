@@ -349,7 +349,8 @@ class ConfusionSet:
     def get_random_confusion(
         self,
         char: str,
-        confusion_type: Optional[str] = None
+        confusion_type: Optional[str] = None,
+        rng: Optional[random.Random] = None
     ) -> Optional[str]:
         """
         获取一个随机的混淆字符
@@ -357,13 +358,15 @@ class ConfusionSet:
         Args:
             char: 原字符
             confusion_type: 混淆类型筛选
+            rng: 可选的随机数生成器
             
         Returns:
             随机混淆字符，如果没有则返回 None
         """
+        _random = rng if rng is not None else random
         confusions = self.get_confusions(char, confusion_type)
         if confusions:
-            return random.choice(confusions)
+            return _random.choice(confusions)
         return None
     
     def has_confusion(self, char: str) -> bool:

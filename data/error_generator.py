@@ -90,14 +90,19 @@ class TruncatedPoisson:
         self.min_val = min_val
         self.max_val = max_val
     
-    def sample(self) -> int:
-        """采样一个值"""
+    def sample(self, rng: Optional[random.Random] = None) -> int:
+        """采样一个值
+        
+        Args:
+            rng: 可选的随机数生成器
+        """
+        _random = rng if rng is not None else random
         while True:
-            val = self._poisson_sample()
+            val = self._poisson_sample(_random)
             if self.min_val <= val <= self.max_val:
                 return val
     
-    def _poisson_sample(self) -> int:
+    def _poisson_sample(self, _random: random.Random) -> int:
         """标准泊松采样（Knuth算法）"""
         L = math.exp(-self.lambda_)
         k = 0
@@ -105,7 +110,7 @@ class TruncatedPoisson:
         
         while p > L:
             k += 1
-            p *= random.random()
+            p *= _random.random()
         
         return k - 1
 
@@ -170,6 +175,12 @@ class ErrorGenerator:
         """
         # 验证概率参数
         pi_total = pi_skip + pi_multiply + pi_replace
+        if pi_total < 1e-6:
+            raise ValueError(
+                f"Sum of pi_skip ({pi_skip}), pi_multiply ({pi_multiply}), "
+                f"pi_replace ({pi_replace}) must be > 0"
+            )
+        
         if abs(pi_total - 1.0) > 1e-6:
             # 归一化
             pi_skip /= pi_total
@@ -209,16 +220,20 @@ class ErrorGenerator:
         if seed is not None:
             random.seed(seed)
     
-    def corrupt(self, sentence: str) -> CorruptionResult:
+    def corrupt(self, sentence: str, rng: Optional[random.Random] = None) -> CorruptionResult:
         """
         对单个句子进行造错
         
         Args:
             sentence: 正确的原始句子
+            rng: 可选的随机数生成器，用于可控随机（分布式训练）
             
         Returns:
             CorruptionResult
         """
+        # 使用传入的 RNG 或默认的全局 random
+        _random = rng if rng is not None else random
+        
         # 检查是否太短
         if len(sentence) < self.min_sentence_length:
             return CorruptionResult(
@@ -229,7 +244,7 @@ class ErrorGenerator:
             )
         
         # 以概率 p_corrupt 决定是否造错
-        if random.random() > self.p_corrupt:
+        if _random.random() > self.p_corrupt:
             return CorruptionResult(
                 original=sentence,
                 corrupted=sentence,
@@ -249,10 +264,10 @@ class ErrorGenerator:
             )
         
         # 采样编辑数量
-        n_edits = min(self.poisson_sampler.sample(), len(editable_positions))
+        n_edits = min(self.poisson_sampler.sample(_random), len(editable_positions))
         
         # 随机选择编辑位置（不重复）
-        edit_positions = random.sample(editable_positions, n_edits)
+        edit_positions = _random.sample(editable_positions, n_edits)
         edit_positions.sort(reverse=True)  # 从后往前处理，避免位置偏移
         
         # 生成错误
@@ -261,10 +276,10 @@ class ErrorGenerator:
         
         for pos in edit_positions:
             # 采样错误类型
-            error_type = self._sample_error_type()
+            error_type = self._sample_error_type(_random)
             
             # 执行错误
-            edit = self._apply_error(corrupted, pos, error_type)
+            edit = self._apply_error(corrupted, pos, error_type, _random)
             if edit:
                 edits.append(edit)
         
@@ -334,9 +349,14 @@ class ErrorGenerator:
         
         return editable
     
-    def _sample_error_type(self) -> ErrorType:
-        """按概率采样错误类型"""
-        r = random.random()
+    def _sample_error_type(self, rng: Optional[random.Random] = None) -> ErrorType:
+        """按概率采样错误类型
+        
+        Args:
+            rng: 可选的随机数生成器
+        """
+        _random = rng if rng is not None else random
+        r = _random.random()
         cumsum = 0.0
         
         for error_type, prob in self.pi.items():
@@ -350,7 +370,8 @@ class ErrorGenerator:
         self,
         chars: List[str],
         pos: int,
-        error_type: ErrorType
+        error_type: ErrorType,
+        rng: Optional[random.Random] = None
     ) -> Optional[ErrorEdit]:
         """
         应用单个错误
@@ -359,10 +380,12 @@ class ErrorGenerator:
             chars: 字符列表（原地修改）
             pos: 位置
             error_type: 错误类型
+            rng: 可选的随机数生成器
             
         Returns:
             ErrorEdit 或 None（如果无法应用）
         """
+        _random = rng if rng is not None else random
         original_char = chars[pos]
         
         if error_type == ErrorType.SKIP:
@@ -378,7 +401,7 @@ class ErrorGenerator:
         elif error_type == ErrorType.MULTIPLY:
             # 重复字：在该位置后插入重复字符
             # 采样重复次数（1 到 max_insert_k）
-            k = random.randint(1, self.max_insert_k)
+            k = _random.randint(1, self.max_insert_k)
             insert_chars = original_char * k
             chars.insert(pos + 1, insert_chars)
             return ErrorEdit(
@@ -390,7 +413,7 @@ class ErrorGenerator:
         
         elif error_type == ErrorType.REPLACE:
             # 错字：替换为混淆字符
-            confusion_char = self.confusion_set.get_random_confusion(original_char)
+            confusion_char = self.confusion_set.get_random_confusion(original_char, rng=_random)
             
             if confusion_char:
                 chars[pos] = confusion_char
@@ -403,7 +426,7 @@ class ErrorGenerator:
             else:
                 # 没有混淆字符，尝试其他类型
                 # 优先尝试重复
-                k = random.randint(1, self.max_insert_k)
+                k = _random.randint(1, self.max_insert_k)
                 insert_chars = original_char * k
                 chars.insert(pos + 1, insert_chars)
                 return ErrorEdit(

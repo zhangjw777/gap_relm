@@ -685,13 +685,25 @@ class OnlineAugmentedDataset(Dataset):
         """获取单个样本（实时造错）"""
         clean_sentence = self.clean_sentences[idx]
         
+        # 使用可控 RNG：结合 idx + worker_id + epoch 生成确定性随机种子
+        # 这样保证分布式训练时各 worker 数据不同但可复现
+        import torch
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        # 使用 hash 生成种子，结合 idx 和 worker_id
+        sample_seed = hash((idx, worker_id, torch.initial_seed())) & 0x7FFFFFFF
+        
+        # 为当前样本创建独立的 RNG
+        import random
+        sample_rng = random.Random(sample_seed)
+        
         # 动态调整 λ
         if self.enable_length_adaptive:
             current_lambda = self.lambda_adapter.get_lambda(len(clean_sentence))
             self.error_generator.set_params(lambda_=current_lambda)
         
-        # 在线造错
-        corruption_result = self.error_generator.corrupt(clean_sentence)
+        # 在线造错（使用独立 RNG）
+        corruption_result = self.error_generator.corrupt(clean_sentence, rng=sample_rng)
         
         # 获取 source（可能有错）和 target（正确）
         source = corruption_result.corrupted  # 错误句子（模型输入）
@@ -704,10 +716,14 @@ class OnlineAugmentedDataset(Dataset):
             )
             return self._convert_to_features(sample)
         except Exception as e:
-            # 如果处理失败，返回一个正确句子的样本（source == target）
-            # 这种情况下 Planner 预测全 KEEP
+            # 如果处理失败，使用原句子作为正例（source == target, 全KEEP标签）
+            # 这样可以让模型学到：对于正确的句子，不做任何修改
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Failed to process sample {idx}, using as positive example: {e}")
+            
             fallback_sample = self.sample_processor.process(
-                clean_sentence, clean_sentence, sample_id=f"online_{idx}_fallback"
+                clean_sentence, clean_sentence, sample_id=f"online_{idx}_positive"
             )
             return self._convert_to_features(fallback_sample)
     

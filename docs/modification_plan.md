@@ -1,6 +1,74 @@
 # Gap-ReLM 项目修改计划
 
-## 修改日期：2025-12-14
+## 最后修改日期：2025-12-14
+
+---
+
+## 零、代码质量改进（2025-12-14 新增 ✅）
+
+### 0.1 背景
+在代码检查过程中发现了5个潜在问题，这些问题不会影响正常运行，但在边界条件下可能导致错误或不一致。
+
+### 0.2 修复的问题
+
+| 问题 | 位置 | 修复内容 | 状态 |
+|------|------|---------|------|
+| **随机种子不确定性** | `data/dataset.py` | 在线数据集使用可控RNG，结合idx+worker_id+torch.initial_seed()生成确定性随机种子 | ✅ |
+| **错误处理逻辑** | `data/dataset.py` | 样本处理失败时作为正例使用（source==target），并添加日志记录 | ✅ |
+| **概率归一化验证** | `data/error_generator.py` | 添加概率和为0的检查，抛出ValueError | ✅ |
+| **混合精度配置冲突** | `scripts/train.py` | 添加fp16和bf16互斥检查，禁止同时使用 | ✅ |
+| **模板构建空指针** | `trainers/trainer.py` | 在scheduled sampling中检查template_result是否为None | ✅ |
+
+### 0.3 详细修改
+
+#### 1. 随机种子可控性（最重要）
+**修改文件**：
+- `data/dataset.py` - OnlineAugmentedDataset.__getitem__
+- `data/error_generator.py` - ErrorGenerator.corrupt, TruncatedPoisson.sample, _sample_error_type, _apply_error
+- `data/confusion_set.py` - ConfusionSet.get_random_confusion
+
+**修改内容**：
+- 在`__getitem__`中使用`hash((idx, worker_id, torch.initial_seed()))`生成样本级RNG
+- ErrorGenerator支持传入可选的`rng`参数
+- 所有使用random的方法都支持可控RNG
+- 保证分布式训练时各worker数据不同但可复现
+
+**优势**：
+- 解决分布式训练时各GPU数据不一致问题
+- 保证训练可复现性
+- 每个epoch数据仍然不同（因为torch.initial_seed()会变化）
+
+#### 2. 错误处理改进
+**修改文件**：`data/dataset.py`
+
+**修改内容**：
+- 样本处理失败时使用干净句子作为正例（source==target, 全KEEP标签）
+- 添加debug级别的日志记录，便于追踪问题
+
+**优势**：
+- 正例有助于模型学习"不修改正确句子"
+- 不会因为个别样本失败而中断训练
+
+#### 3. 概率验证
+**修改文件**：`data/error_generator.py`
+
+**修改内容**：
+- 在概率归一化前检查`pi_total < 1e-6`
+- 抛出详细的ValueError错误信息
+
+#### 4. 混合精度互斥
+**修改文件**：`scripts/train.py`
+
+**修改内容**：
+- 在main函数开始处检查`args.fp16 and args.bf16`
+- 如果同时设置则抛出ValueError
+
+#### 5. 空指针检查
+**修改文件**：`trainers/trainer.py`
+
+**修改内容**：
+- 在`_apply_scheduled_sampling`中检查`template_result is None or template_result.template_ids is None`
+- 失败时记录warning并使用原始Gold Template
 
 ---
 
