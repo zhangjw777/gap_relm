@@ -664,7 +664,7 @@ class OnlineAugmentedDataset(Dataset):
         for sent in self.clean_sentences:
             # 规范化
             if self.preprocessor:
-                sent = self.preprocessor.preprocess_single(sent)
+                sent = self.preprocessor.preprocess(sent)
             
             # 跳过空句子
             if not sent or len(sent) < 5:

@@ -34,13 +34,17 @@ def get_optimizer(
     # 分组参数
     optimizer_grouped_parameters = []
     
+    # 记录已处理的参数ID，避免重复
+    processed_param_ids = set()
+    
     # 编码器参数
     encoder_params_decay = []
     encoder_params_no_decay = []
     
     for name, param in model.encoder.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or id(param) in processed_param_ids:
             continue
+        processed_param_ids.add(id(param))
         if any(nd in name for nd in no_decay_keywords):
             encoder_params_no_decay.append(param)
         else:
@@ -65,8 +69,9 @@ def get_optimizer(
     planner_params_no_decay = []
     
     for name, param in model.planner.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or id(param) in processed_param_ids:
             continue
+        processed_param_ids.add(id(param))
         if any(nd in name for nd in no_decay_keywords):
             planner_params_no_decay.append(param)
         else:
@@ -91,8 +96,9 @@ def get_optimizer(
     infiller_params_no_decay = []
     
     for name, param in model.infiller.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or id(param) in processed_param_ids:
             continue
+        processed_param_ids.add(id(param))
         if any(nd in name for nd in no_decay_keywords):
             infiller_params_no_decay.append(param)
         else:
@@ -116,8 +122,9 @@ def get_optimizer(
         verifier_params_decay = []
         verifier_params_no_decay = []
         
-        for name, param in model.verifier.named_parameters():
-            if not param.requires_grad:
+        for name, param in model.verif or id(param) in processed_param_ids:
+                continue
+            processed_param_ids.add(id(param)).requires_grad:
                 continue
             if any(nd in name for nd in no_decay_keywords):
                 verifier_params_no_decay.append(param)
@@ -136,6 +143,33 @@ def get_optimizer(
                 "weight_decay": 0.0,
                 "lr": learning_rate
             })
+    
+    # P-Tuning 参数（如果存在且未被处理）
+    ptuning_params = []
+    if hasattr(model, 'planner_ptuning') and model.planner_ptuning is not None:
+        for param in model.planner_ptuning.parameters():
+            if param.requires_grad and id(param) not in processed_param_ids:
+                ptuning_params.append(param)
+                processed_param_ids.add(id(param))
+    
+    if hasattr(model, 'infiller_ptuning') and model.infiller_ptuning is not None:
+        for param in model.infiller_ptuning.parameters():
+            if param.requires_grad and id(param) not in processed_param_ids:
+                ptuning_params.append(param)
+                processed_param_ids.add(id(param))
+    
+    if hasattr(model, 'ptuning') and model.ptuning is not None:
+        for param in model.ptuning.parameters():
+            if param.requires_grad and id(param) not in processed_param_ids:
+                ptuning_params.append(param)
+                processed_param_ids.add(id(param))
+    
+    if ptuning_params:
+        optimizer_grouped_parameters.append({
+            "params": ptuning_params,
+            "weight_decay": 0.0,  # P-Tuning 参数不使用权重衰减
+            "lr": learning_rate
+        })
     
     return AdamW(optimizer_grouped_parameters)
 
