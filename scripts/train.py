@@ -259,9 +259,12 @@ def main():
     if is_distributed:
         args.local_rank = local_rank
     
-    # 设置日志
+    # 设置日志（只在主进程设置详细日志）
     if is_main_process:
         setup_logging(args.log_level)
+    else:
+        # 非主进程：只显示WARNING及以上
+        logging.basicConfig(level=logging.WARNING)
     
     logger = logging.getLogger(__name__)
     

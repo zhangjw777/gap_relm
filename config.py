@@ -252,8 +252,8 @@ class DistributedConfig:
     # 同步BN
     sync_bn: bool = False
     
-    # 找到未使用的参数
-    find_unused_parameters: bool = False
+    # 找到未使用的参数（P-Tuning等）
+    find_unused_parameters: bool = True
 
 
 @dataclass

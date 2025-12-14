@@ -122,10 +122,10 @@ def get_optimizer(
         verifier_params_decay = []
         verifier_params_no_decay = []
         
-        for name, param in model.verif or id(param) in processed_param_ids:
+        for name, param in model.verifier.named_parameters():
+            if not param.requires_grad or id(param) in processed_param_ids:
                 continue
-            processed_param_ids.add(id(param)).requires_grad:
-                continue
+            processed_param_ids.add(id(param))
             if any(nd in name for nd in no_decay_keywords):
                 verifier_params_no_decay.append(param)
             else:
