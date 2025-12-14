@@ -18,8 +18,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-from ..models import GapReLMModel
-from ..config import GapReLMConfig, TrainingStage
+from models import GapReLMModel
+from config import GapReLMConfig, TrainingStage
 from .scheduler import get_optimizer, get_scheduler, ScheduledSamplingScheduler
 
 
@@ -479,7 +479,7 @@ class GapReLMTrainer:
             )
         
         # 构建预测模板
-        from ..models.template_builder import TemplateBuilder
+        from models.template_builder import TemplateBuilder
         template_builder = TemplateBuilder(
             tokenizer=self.tokenizer,
             max_seq_length=self.config.model.max_seq_length,

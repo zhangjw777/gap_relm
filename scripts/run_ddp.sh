@@ -3,7 +3,7 @@
 # 用于Planner + Infiller联合多任务训练
 
 # ========== 必填参数 ==========
-TRAIN_FILE=""                              # 必须：训练数据文件路径
+TRAIN_FILE="data/clean_sentences.txt"                              # 必须：训练数据文件路径
 DEV_FILE=""                                # 可选：验证数据文件路径（推荐提供）
 
 # ========== 基础配置 ==========
@@ -40,8 +40,8 @@ USE_CACHE=true                             # 是否使用缓存
 
 # ========== 在线动态数据增强 ==========
 ONLINE_AUGMENT=true                        # 启用在线动态数据增强（默认开启）
-CLEAN_TRAIN_FILE=""                        # 干净训练句子文件（留空则使用TRAIN_FILE）
-FROZEN_DEV_FILE=""                         # 固定验证集文件（推荐使用）
+CLEAN_TRAIN_FILE="data/clean_sentences.txt"                        # 干净训练句子文件（留空则使用TRAIN_FILE）
+FROZEN_DEV_FILE="data/frozen_dev.jsonl"                         # 固定验证集文件（推荐使用）
 CLEAN_FILE_FORMAT="txt"                    # 干净文件格式（txt/json/jsonl）
 P_CORRUPT=0.7                              # 造错概率
 BASE_LAMBDA=1.5                            # 基础泊松参数

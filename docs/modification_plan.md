@@ -10,7 +10,7 @@
 由于项目根目录本身就叫 `gap_relm`，而代码中使用了 `from gap_relm.xxx` 的导入方式，导致在服务器上运行时出现 `ModuleNotFoundError: No module named 'gap_relm'`。
 
 ### 0.1 修复
-修改所有脚本的导入语句，去掉 `gap_relm.` 前缀：
+修改所有模块文件的导入语句，去掉 `gap_relm.` 前缀和相对导入：
 
 | 文件 | 修改前 | 修改后 | 状态 |
 |------|--------|--------|------|
@@ -18,6 +18,11 @@
 | `scripts/train.py` | `from gap_relm.config import ...` | `from config import ...` | ✅ |
 | `scripts/generate_training_data.py` | `from gap_relm.data.augmentation import ...` | `from data.augmentation import ...` | ✅ |
 | `scripts/predict.py` | `from gap_relm.inference import ...` | `from inference import ...` | ✅ |
+| `trainers/trainer.py` | `from ..models import ...` | `from models import ...` | ✅ |
+| `trainers/trainer.py` | `from ..config import ...` | `from config import ...` | ✅ |
+| `inference.py` | `from ..models import ...` | `from models import ...` | ✅ |
+| `inference.py` | `from ..config import ...` | `from config import ...` | ✅ |
+| `models/gap_relm.py` | `from ..config import ...` | `from config import ...` | ✅ |
 
 现在可以直接在项目根目录运行脚本：
 ```bash

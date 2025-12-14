@@ -514,7 +514,7 @@ class GapReLMModel(nn.Module):
     def from_pretrained(cls, load_path: str, config=None):
         """加载模型"""
         import os
-        from ..config import GapReLMConfig
+        from config import GapReLMConfig
         
         # 加载配置
         if config is None:

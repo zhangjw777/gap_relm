@@ -8,9 +8,9 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 from tqdm import tqdm
 
-from ..models import GapReLMModel
-from ..models.template_builder import InferenceTemplateBuilder
-from ..config import GapReLMConfig
+from models import GapReLMModel
+from models.template_builder import InferenceTemplateBuilder
+from config import GapReLMConfig
 
 
 @dataclass
@@ -377,7 +377,7 @@ class GapReLMPipeline:
             device: 设备 ("cuda", "cpu", None=auto)
         """
         from transformers import AutoTokenizer
-        from ..config import GapReLMConfig
+        from config import GapReLMConfig
         
         # 加载配置
         self.config = GapReLMConfig.load(f"{model_path}/config.json")
