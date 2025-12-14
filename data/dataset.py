@@ -141,36 +141,97 @@ class GapReLMDataset(Dataset):
         
         raw_pairs = self.data_loader_map[data_format](data_file)
         
-        # 预处理和对齐
-        samples = []
-        print(f"Processing {len(raw_pairs)} samples...")
-        for i, (source, target) in enumerate(tqdm(raw_pairs)):
-            # 预处理
-            if self.preprocessor:
-                source, target = self.preprocessor.preprocess_pair(source, target)
-            
-            # 跳过空样本
-            if not source or not target:
-                continue
-            
-            # 跳过过长样本
-            if len(source) > self.max_seq_length - 2 or len(target) > self.max_seq_length - 2:
-                continue
-            
-            try:
-                sample = self.sample_processor.process(
-                    source, target, sample_id=f"sample_{i}"
-                )
-                samples.append(sample)
-            except Exception as e:
-                print(f"Warning: Failed to process sample {i}: {e}")
-                continue
+        # 检查是否有预计算样本（由_load_mucgec设置）
+        if hasattr(self, '_has_precomputed') and self._has_precomputed:
+            samples = self._process_precomputed_samples()
+        else:
+            # 传统流程：预处理和对齐
+            samples = []
+            print(f"Processing {len(raw_pairs)} samples...")
+            for i, (source, target) in enumerate(tqdm(raw_pairs)):
+                # 预处理
+                if self.preprocessor:
+                    source, target = self.preprocessor.preprocess_pair(source, target)
+                
+                # 跳过空样本
+                if not source or not target:
+                    continue
+                
+                # 跳过过长样本
+                if len(source) > self.max_seq_length - 2 or len(target) > self.max_seq_length - 2:
+                    continue
+                
+                try:
+                    sample = self.sample_processor.process(
+                        source, target, sample_id=f"sample_{i}"
+                    )
+                    samples.append(sample)
+                except Exception as e:
+                    print(f"Warning: Failed to process sample {i}: {e}")
+                    continue
         
         # 保存缓存
         if use_cache and cache_dir:
             self._save_cache(samples, cache_file)
         
         print(f"Loaded {len(samples)} samples")
+        return samples
+    
+    def _process_precomputed_samples(self) -> List[ProcessedSample]:
+        """处理预计算标签的样本（无需对齐）"""
+        from .label_generator import PlannerLabels, GoldTemplate, ProcessedSample
+        from .alignment import AlignmentResult, EditOperation, EditType
+        
+        samples = []
+        print(f"加载 {len(self._precomputed_samples)} 个预计算样本...")
+        
+        for i, data in enumerate(tqdm(self._precomputed_samples)):
+            source = data['source']
+            target = data['target']
+            
+            # 跳过过长样本
+            if len(source) > self.max_seq_length - 2:
+                continue
+            
+            # 构建 PlannerLabels
+            planner_labels = PlannerLabels(
+                op_labels=data['op_labels'],
+                insert_labels=data['insert_labels'],
+                source=source,
+                target=target,
+            )
+            
+            # 构建 GoldTemplate
+            template_tokens = data.get('template_tokens', list(source))
+            gold_tokens = data.get('gold_tokens', [])
+            mask_positions = data.get('mask_positions', [])
+            
+            gold_template = GoldTemplate(
+                template_tokens=template_tokens,
+                gold_tokens=gold_tokens,
+                mask_positions=mask_positions,
+                source=source,
+                target=target,
+            )
+            
+            # 构建空的 AlignmentResult（预计算不需要）
+            alignment_result = AlignmentResult(
+                source=source,
+                target=target,
+                operations=[],
+                edit_distance=len([op for op in data['op_labels'] if op != 0]),
+            )
+            
+            sample = ProcessedSample(
+                source=source,
+                target=target,
+                planner_labels=planner_labels,
+                gold_template=gold_template,
+                alignment_result=alignment_result,
+                sample_id=f"sample_{i}",
+            )
+            samples.append(sample)
+        
         return samples
     
     def _get_cache_path(self, data_file: str, cache_dir: str) -> str:
@@ -194,8 +255,16 @@ class GapReLMDataset(Dataset):
     # ========== 数据加载器 ==========
     
     def _load_mucgec(self, data_file: str) -> List[Tuple[str, str]]:
-        """加载 MuCGEC 格式数据"""
+        """加载 MuCGEC 格式数据
+        
+        支持两种格式：
+        1. 基础格式：{"source": "...", "target": "..."} - 需要后续对齐
+        2. 预计算格式：{"source": "...", "target": "...", "op_labels": [...], ...} - 直接使用
+        """
         pairs = []
+        self._precomputed_samples = []  # 存储预计算样本
+        self._has_precomputed = False
+        
         with open(data_file, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
@@ -212,12 +281,21 @@ class GapReLMDataset(Dataset):
                         target = target[0] if target else source
                     
                     if source and target:
-                        pairs.append((source, target))
+                        # 检查是否有预计算标签
+                        if 'op_labels' in data and 'insert_labels' in data:
+                            self._has_precomputed = True
+                            self._precomputed_samples.append(data)
+                        else:
+                            pairs.append((source, target))
+                            
                 except json.JSONDecodeError:
                     # 可能是制表符分隔格式
                     parts = line.split('\t')
                     if len(parts) >= 2:
                         pairs.append((parts[0], parts[1]))
+        
+        if self._has_precomputed:
+            print(f"检测到预计算标签格式，将跳过对齐步骤")
         
         return pairs
     

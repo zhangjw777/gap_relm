@@ -27,6 +27,7 @@ def create_data_loaders(
     data_format: str = "mucgec",
     batch_size: int = 32,
     num_workers: int = 4,
+    prefetch_factor: int = 2,
     cache_dir: Optional[str] = None,
     use_cache: bool = True,
     normalize_text: bool = True,
@@ -52,6 +53,7 @@ def create_data_loaders(
         data_format: 数据格式
         batch_size: 批大小
         num_workers: 数据加载工作进程数
+        prefetch_factor: 每个 worker 预取的 batch 数
         cache_dir: 缓存目录
         use_cache: 是否使用缓存
         normalize_text: 是否规范化文本
@@ -101,6 +103,7 @@ def create_data_loaders(
             batch_size=batch_size,
             sampler=train_sampler,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=collator,
             pin_memory=True,
             drop_last=True
@@ -111,6 +114,7 @@ def create_data_loaders(
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=collator,
             pin_memory=True,
             drop_last=True
@@ -133,6 +137,7 @@ def create_data_loaders(
                 batch_size=batch_size,
                 sampler=dev_sampler,
                 num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 collate_fn=collator,
                 pin_memory=True
             )
@@ -142,6 +147,7 @@ def create_data_loaders(
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 collate_fn=collator,
                 pin_memory=True
             )
@@ -163,6 +169,7 @@ def create_data_loaders(
                 batch_size=batch_size,
                 sampler=test_sampler,
                 num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 collate_fn=collator,
                 pin_memory=True
             )
@@ -172,6 +179,7 @@ def create_data_loaders(
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 collate_fn=collator,
                 pin_memory=True
             )
@@ -192,6 +200,7 @@ def create_online_data_loaders(
     data_format: str = "mucgec",
     batch_size: int = 32,
     num_workers: int = 4,
+    prefetch_factor: int = 2,
     normalize_text: bool = True,
     enable_aux_mlm: bool = True,
     aux_mlm_prob: float = 0.15,
@@ -334,6 +343,7 @@ def create_online_data_loaders(
             batch_size=batch_size,
             sampler=train_sampler,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=collator,
             pin_memory=True,
             drop_last=True
@@ -344,6 +354,7 @@ def create_online_data_loaders(
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=collator,
             pin_memory=True,
             drop_last=True

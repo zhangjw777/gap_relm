@@ -4,6 +4,84 @@
 
 ---
 
+## 〇-0、静态训练数据生成功能（2025-12-14 新增 ✅）
+
+### 0.0.1 背景与需求
+在线动态数据增强存在CPU瓶颈（实时编辑距离对齐），改用预生成静态数据并**直接保存预计算标签**。
+
+**核心优化**：
+- 造错时已知编辑操作（位置、类型、字符），直接生成Planner标签和Gold Template
+- 训练时零CPU开销，直接读取标签，跳过对齐算法
+- 兼容旧格式：检测到预计算字段则直接使用，否则走传统对齐流程
+
+### 0.0.2 代码修改
+
+| 文件 | 修改 |
+|------|------|
+| `data/error_generator.py` | 新增 `corrupt_with_type()` 方法 |
+| `data/augmentation.py` | 精简重构，`StaticDataGenerator` 支持生成预计算标签 |
+| `data/dataset.py` | `_load_mucgec` 检测预计算格式，`_load_and_process` 支持跳过对齐 |
+| `scripts/generate_training_data.py` | 精简为纯静态数据生成脚本 |
+
+### 0.0.3 数据格式
+
+**预计算格式（推荐）**：
+```json
+{
+  "source": "错误句子",
+  "target": "正确句子",
+  "op_labels": [0, 0, 2, 0, 0],
+  "insert_labels": [0, 0, 0, 0, 0],
+  "template_tokens": ["错", "误", "[MASK]", "子"],
+  "gold_tokens": ["句"],
+  "mask_positions": [2]
+}
+```
+
+**基础格式（兼容）**：
+```json
+{"source": "错误句子", "target": "正确句子"}
+```
+
+### 0.0.4 使用方法
+
+```bash
+python scripts/generate_training_data.py \
+    --clean_file data/clean_sentences.txt \
+    --output_dir ./static_training_data \
+    --confusion_file data/confusion_sets/pycorrect_merged.json \
+    --num_negative 2 \
+    --pi_skip 0.2 --pi_multiply 0.3 --pi_replace 0.5 \
+    --seed 42
+```
+
+### 0.0.5 待办：开源数据离线编译
+
+对于没有预计算标签的开源数据集（如MuCGEC、SIGHAN），可以一次性"离线编译"成预计算格式：
+
+```python
+# TODO: 实现离线编译脚本
+# python scripts/compile_dataset.py \
+#     --input data/mucgec/train.json \
+#     --output data/mucgec/train_compiled.jsonl
+```
+
+### 0.0.6 脚本兼容性检查（2025-12-14 完成 ✅）
+
+已验证 `scripts/` 下所有脚本的导入兼容性：
+
+| 脚本 | 导入 | 状态 |
+|------|------|------|
+| `generate_training_data.py` | `StaticDataGenerator, StaticSampleConfig` | ✅ |
+| `train.py` | `create_data_loaders, create_online_data_loaders` | ✅ |
+| `generate_frozen_dev.py` | `DataAugmentor, AugmentationConfig` | ✅ |
+| `predict.py` | 无 `data` 模块依赖 | ✅ |
+| `convert_pycorrect_confusion.py` | 无 `data` 模块依赖 | ✅ |
+
+所有脚本无需修改，`data/__init__.py` 已正确导出所有必需的类和函数。
+
+---
+
 ## 〇、关键缺陷修复与 API 更新（2025-12-14 修复 ✅）
 
 ### 0.1 Scheduled Sampling 逻辑缺陷修复
@@ -100,21 +178,46 @@ total_loss = total_loss + ptuning_dummy_loss
 
 ### 0.5 BatchSize 与显存分析
 
-**双 4090 (24GB×2) + MacBERT-base + BatchSize=128 显存估算**：
+**双 4090 (24GB×2) + MacBERT-base + BatchSize=128 显存估算（修正版）**：
+
+Gap-ReLM 是 **Planner + Infiller 双模型**架构，显存需求比单模型高很多：
 
 | 组件 | FP16 估算 |
 |------|----------|
-| 模型参数 | ~204 MB |
-| 梯度 | ~204 MB |
-| 优化器状态 (Adam) | ~816 MB |
-| 激活值 (128 × 128 × 768 × 12层) | ~12-15 GB |
-| 临时缓冲区 | ~1-2 GB |
-| **总计** | **~15-18 GB/GPU** |
+| 模型参数 (×2) | ~400 MB |
+| 梯度 (×2) | ~400 MB |
+| 优化器状态 | ~1.6 GB |
+| **Planner 激活值** | ~15 GB |
+| **Infiller 激活值** | ~15 GB |
+| **Infiller Logits 峰值** (B×L×V) | ~35 GB |
+| **总计（峰值）** | **~67 GB** |
 
-**建议**：
-- 如果 `batch_size=128` 出现 OOM，建议降到 `batch_size=64` 或 `batch_size=32`
-- 使用 `gradient_accumulation_steps=4` 来等效获得更大的有效批次
-- 确认没有其他进程占用 GPU 显存
+**建议配置**：
+- `batch_size=16` (per-GPU=8) + `gradient_accumulation_steps=8`
+- 或 `batch_size=32` (per-GPU=16) + `gradient_accumulation_steps=4`
+
+### 0.6 数据加载性能优化
+
+**问题**：在线数据增强导致训练速度慢（1.4s/it）
+
+**解决方案**：
+1. 添加 `--prefetch_factor` 参数支持（默认 2，可增大到 4-8）
+2. 建议增大 `--num_workers` 到 8-16
+
+**修改文件**：
+- `scripts/train.py` - 添加 `--prefetch_factor` 参数
+- `data/data_loader.py` - 传递 `prefetch_factor` 给 DataLoader
+- `scripts/run_ddp.sh` - 添加 `PREFETCH_FACTOR` 配置
+
+### 0.7 断点续训支持
+
+项目已支持断点续训，使用方式：
+```bash
+./scripts/run_ddp.sh  # 正常训练
+
+# 中断后恢复
+# 在 run_ddp.sh 中添加：--resume_from ./outputs/checkpoint-1500
+```
 
 ---
 

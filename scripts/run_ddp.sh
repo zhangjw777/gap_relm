@@ -34,7 +34,8 @@ USE_FP16=true                              # 使用FP16混合精度（推荐）
 USE_BF16=false                             # 使用BF16混合精度（如果GPU支持）
 
 # ========== 数据加载 ==========
-NUM_WORKERS=16                              # 数据加载进程数
+NUM_WORKERS=16                              # 数据加载进程数（建议 4-16，在线增强时增大）
+PREFETCH_FACTOR=4                          # 每个worker预取的batch数（默认2，可增大到4-8）
 CACHE_DIR="./cache"                        # 缓存目录
 USE_CACHE=true                             # 是否使用缓存
 
@@ -329,6 +330,7 @@ CMD="torchrun \
     --weight_decay $WEIGHT_DECAY \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --num_workers $NUM_WORKERS \
+    --prefetch_factor $PREFETCH_FACTOR \
     --cache_dir \"$CACHE_DIR\" \
     --logging_steps $LOGGING_STEPS \
     --save_steps $SAVE_STEPS \

@@ -6,29 +6,19 @@
 import os
 import json
 import random
-from typing import List, Tuple, Optional, Dict, Any, Iterator
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from .confusion_set import ConfusionSet, create_default_confusion_set
-from .protected_span import ProtectedSpanDetector, create_default_detector
-from .error_generator import ErrorGenerator, CorruptionResult
+from .confusion_set import ConfusionSet
+from .protected_span import ProtectedSpanDetector
+from .error_generator import ErrorGenerator, CorruptionResult, ErrorType, ErrorEdit
 
 
 @dataclass
 class AugmentationConfig:
-    """数据增强配置
-    
-    四个主旋钮：
-    - p_corrupt: 造错概率
-    - lambda_: 编辑数量泊松参数
-    - pi: 各类型概率分布
-    - max_edits: 单句最大编辑数
-    """
-    # 造错概率
+    """数据增强配置"""
+    # 造错概率（在线动态增强用）
     p_corrupt: float = 0.7
-    
-    # 泊松参数
     lambda_: float = 1.5
     
     # 错误类型概率 (S: 删字, M: 重复字, R: 错字)
@@ -84,32 +74,21 @@ class AugmentationConfig:
 
 class DataAugmentor:
     """
-    数据增强器
-    
-    从干净句子自动生成训练数据
+    数据增强器（在线动态增强用）
     """
     
     def __init__(self, config: Optional[AugmentationConfig] = None):
-        """
-        初始化数据增强器
-        
-        Args:
-            config: 增强配置，如果为 None 则使用默认配置
-        """
         self.config = config or AugmentationConfig()
         
-        # 设置随机种子
         if self.config.seed is not None:
             random.seed(self.config.seed)
         
-        # 创建混淆集
         self.confusion_set = ConfusionSet(
             use_default_shape=self.config.use_default_shape_confusion,
             use_default_pinyin=self.config.use_default_pinyin_confusion,
             custom_confusion_files=self.config.custom_confusion_files or None,
         )
         
-        # 创建保护检测器
         self.protected_detector = ProtectedSpanDetector(
             enable_doc_number=self.config.enable_doc_number_protection,
             enable_date=self.config.enable_date_protection,
@@ -121,7 +100,6 @@ class DataAugmentor:
             custom_protected_words=set(self.config.custom_protected_words) if self.config.custom_protected_words else None,
         )
         
-        # 创建造错器
         self.error_generator = ErrorGenerator(
             p_corrupt=self.config.p_corrupt,
             lambda_=self.config.lambda_,
@@ -139,59 +117,15 @@ class DataAugmentor:
         )
     
     def augment(self, sentence: str) -> CorruptionResult:
-        """
-        对单个句子进行增强
-        
-        Args:
-            sentence: 干净的正确句子
-            
-        Returns:
-            CorruptionResult
-        """
+        """对单个句子进行增强"""
         return self.error_generator.corrupt(sentence)
     
-    def augment_batch(
-        self,
-        sentences: List[str],
-        show_progress: bool = False
-    ) -> List[CorruptionResult]:
-        """
-        批量增强
-        
-        Args:
-            sentences: 句子列表
-            show_progress: 是否显示进度
-            
-        Returns:
-            增强结果列表
-        """
+    def augment_batch(self, sentences: List[str], show_progress: bool = False) -> List[CorruptionResult]:
+        """批量增强"""
         return self.error_generator.corrupt_batch(sentences, show_progress)
     
-    def generate_training_pairs(
-        self,
-        sentences: List[str],
-        show_progress: bool = False
-    ) -> List[Tuple[str, str]]:
-        """
-        从干净句子生成训练数据对
-        
-        Args:
-            sentences: 干净句子列表
-            show_progress: 是否显示进度
-            
-        Returns:
-            训练数据对列表 [(错误句, 正确句), ...]
-        """
-        results = self.augment_batch(sentences, show_progress)
-        return [r.to_training_pair() for r in results]
-    
     def update_params(self, **kwargs):
-        """
-        更新造错参数（用于调参）
-        
-        Args:
-            **kwargs: 参数名=值
-        """
+        """更新造错参数"""
         self.error_generator.set_params(**kwargs)
     
     def get_stats(self, results: List[CorruptionResult]) -> Dict[str, Any]:
@@ -199,82 +133,298 @@ class DataAugmentor:
         return self.error_generator.stats(results)
 
 
-class TrainingDataGenerator:
+@dataclass
+class StaticSampleConfig:
+    """静态数据生成配置
+    
+    每个干净句子生成：1个正例 + num_negative个不同类型的负例
+    每个负例只有1个错误
     """
-    训练数据生成器
+    # 每个句子生成的负例数量
+    num_negative_per_sentence: int = 2
     
-    从干净语料生成 train/dev/test 数据集并保存
+    # 错误类型概率（用于选择错误类型）
+    pi_skip: float = 0.2
+    pi_multiply: float = 0.3
+    pi_replace: float = 0.5
+    
+    # 混淆集配置
+    use_default_shape_confusion: bool = True
+    use_default_pinyin_confusion: bool = True
+    custom_confusion_files: List[str] = field(default_factory=list)
+    
+    # 保护约束配置
+    enable_protection: bool = True
+    
+    # 其他选项
+    min_sentence_length: int = 5
+    skip_punct: bool = True
+    max_insert_k: int = 3
+    seed: Optional[int] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'num_negative_per_sentence': self.num_negative_per_sentence,
+            'pi_skip': self.pi_skip,
+            'pi_multiply': self.pi_multiply,
+            'pi_replace': self.pi_replace,
+            'enable_protection': self.enable_protection,
+            'min_sentence_length': self.min_sentence_length,
+            'max_insert_k': self.max_insert_k,
+            'seed': self.seed,
+        }
+
+
+class StaticDataGenerator:
+    """
+    静态训练数据生成器
+    
+    特点：
+    - 每个句子生成1个正例 + N个负例
+    - 每个负例只有1个错误，且错误类型不同
+    - 先划分句子再生成样本，避免同源句泄露
     """
     
-    def __init__(
-        self,
-        augmentor: Optional[DataAugmentor] = None,
-        config: Optional[AugmentationConfig] = None,
-    ):
-        """
-        初始化生成器
-        
-        Args:
-            augmentor: 数据增强器
-            config: 增强配置（如果 augmentor 为 None）
-        """
-        self.augmentor = augmentor or DataAugmentor(config)
+    ERROR_TYPES = [ErrorType.SKIP, ErrorType.MULTIPLY, ErrorType.REPLACE]
     
-    def load_clean_sentences(
+    def __init__(self, config: Optional[StaticSampleConfig] = None):
+        self.config = config or StaticSampleConfig()
+        
+        if self.config.seed is not None:
+            random.seed(self.config.seed)
+        
+        # 创建混淆集
+        self.confusion_set = ConfusionSet(
+            use_default_shape=self.config.use_default_shape_confusion,
+            use_default_pinyin=self.config.use_default_pinyin_confusion,
+            custom_confusion_files=self.config.custom_confusion_files or None,
+        )
+        
+        # 创建保护检测器
+        self.protected_detector = ProtectedSpanDetector(
+            enable_doc_number=self.config.enable_protection,
+            enable_date=self.config.enable_protection,
+            enable_amount=self.config.enable_protection,
+            enable_clause_number=self.config.enable_protection,
+            enable_organization=self.config.enable_protection,
+            enable_law_name=self.config.enable_protection,
+            enable_fixed_phrase=self.config.enable_protection,
+        )
+        
+        # 创建造错器
+        self.error_generator = ErrorGenerator(
+            p_corrupt=1.0,  # 总是造错
+            lambda_=1.0,
+            pi_skip=self.config.pi_skip,
+            pi_multiply=self.config.pi_multiply,
+            pi_replace=self.config.pi_replace,
+            max_edits_per_sent=1,
+            max_insert_k=self.config.max_insert_k,
+            confusion_set=self.confusion_set,
+            protected_detector=self.protected_detector,
+            enable_protection=self.config.enable_protection,
+            min_sentence_length=self.config.min_sentence_length,
+            skip_punct=self.config.skip_punct,
+            seed=self.config.seed,
+        )
+        
+        # 归一化错误类型概率
+        total = self.config.pi_skip + self.config.pi_multiply + self.config.pi_replace
+        self.type_probs = {
+            ErrorType.SKIP: self.config.pi_skip / total,
+            ErrorType.MULTIPLY: self.config.pi_multiply / total,
+            ErrorType.REPLACE: self.config.pi_replace / total,
+        }
+    
+    def _sample_error_types(self, n: int, rng: random.Random) -> List[ErrorType]:
+        """按概率采样n个不同的错误类型"""
+        if n >= len(self.ERROR_TYPES):
+            types = self.ERROR_TYPES.copy()
+            rng.shuffle(types)
+            return types
+        
+        # 按概率加权采样不重复的类型
+        selected = []
+        available = list(self.ERROR_TYPES)
+        
+        for _ in range(n):
+            weights = [self.type_probs[t] for t in available]
+            total = sum(weights)
+            weights = [w / total for w in weights]
+            
+            r = rng.random()
+            cumsum = 0.0
+            for i, w in enumerate(weights):
+                cumsum += w
+                if r < cumsum:
+                    selected.append(available.pop(i))
+                    break
+        
+        return selected
+    
+    def _generate_labels_from_edit(
         self,
-        file_path: str,
-        file_format: str = "txt",
-        text_field: str = "text",
-    ) -> List[str]:
+        source: str,          # 错误句子
+        target: str,          # 正确句子
+        edit: ErrorEdit,      # 造错时的编辑操作
+    ) -> Dict[str, Any]:
         """
-        加载干净句子
+        从造错的编辑操作直接生成训练标签
         
-        Args:
-            file_path: 文件路径
-            file_format: 文件格式 ("txt", "json", "jsonl")
-            text_field: JSON中的文本字段名
-            
-        Returns:
-            句子列表
+        注意：造错是 target → source（正确→错误）
+        纠错是 source → target（错误→正确）
+        
+        造错操作与纠错标签的映射：
+        - SKIP（删字）: 正确句子中某字被删除 → 纠错需要在source中插入
+        - MULTIPLY（重复字）: 正确句子中某字被重复 → 纠错需要删除source中多余的字
+        - REPLACE（替换）: 正确句子中某字被替换 → 纠错需要替换source中的错字
         """
-        sentences = []
+        n = len(source)
+        op_labels = [0] * n       # 默认 KEEP=0
+        insert_labels = [0] * n   # 默认不插入
         
-        with open(file_path, 'r', encoding='utf-8') as f:
-            if file_format == "txt":
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        sentences.append(line)
-            
-            elif file_format == "json":
-                data = json.load(f)
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, str):
-                            sentences.append(item)
-                        elif isinstance(item, dict) and text_field in item:
-                            sentences.append(item[text_field])
-                elif isinstance(data, dict):
-                    for key, value in data.items():
-                        if isinstance(value, str):
-                            sentences.append(value)
-                        elif isinstance(value, dict) and text_field in value:
-                            sentences.append(value[text_field])
-            
-            elif file_format == "jsonl":
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            if isinstance(data, str):
-                                sentences.append(data)
-                            elif isinstance(data, dict) and text_field in data:
-                                sentences.append(data[text_field])
-                        except json.JSONDecodeError:
-                            continue
+        template_tokens = []
+        gold_tokens = []
+        mask_positions = []
         
-        return sentences
+        edit_pos = edit.position  # 在原始正确句子(target)中的位置
+        
+        if edit.error_type == ErrorType.SKIP:
+            # SKIP：target中位置edit_pos的字被删除了
+            # source比target短1个字
+            # 纠错：需要在source的edit_pos位置**之前**插入被删除的字
+            # 使用Left-Association规则：插入归属到左侧字符
+            if edit_pos > 0:
+                # 插入归属到source[edit_pos-1]（因为target[edit_pos]被删了，source中edit_pos-1后面需要插入）
+                insert_labels[edit_pos - 1] = 1
+                # Gold Template: 前edit_pos个字 + [MASK] + 后面的字
+                template_tokens = list(source[:edit_pos]) + ['[MASK]'] + list(source[edit_pos:])
+                gold_tokens = [edit.original_char]  # 被删除的字
+                mask_positions = [edit_pos]
+            else:
+                # 句首插入：归属到第一个字符
+                insert_labels[0] = 1
+                template_tokens = ['[MASK]'] + list(source)
+                gold_tokens = [edit.original_char]
+                mask_positions = [0]
+        
+        elif edit.error_type == ErrorType.MULTIPLY:
+            # MULTIPLY：target中位置edit_pos的字后面被重复了k次
+            # source比target长k个字
+            # 错误字符串 = edit.error_char（重复的字符串，长度可能>1）
+            k = len(edit.error_char)  # 重复的次数
+            # source中：edit_pos是原字符，edit_pos+1到edit_pos+k是重复的字符
+            # 纠错：需要删除source中edit_pos+1到edit_pos+k的字符
+            for i in range(k):
+                pos_in_source = edit_pos + 1 + i
+                if pos_in_source < n:
+                    op_labels[pos_in_source] = 1  # DELETE
+            # Gold Template: 删除的字不出现
+            for i in range(n):
+                if op_labels[i] != 1:  # 不是DELETE的字
+                    template_tokens.append(source[i])
+        
+        elif edit.error_type == ErrorType.REPLACE:
+            # REPLACE：target中位置edit_pos的字被替换成了错误字符
+            # source和target长度相同
+            # source[edit_pos] = edit.error_char (错误的字)
+            # target[edit_pos] = edit.original_char (正确的字)
+            # 纠错：需要替换source[edit_pos]
+            op_labels[edit_pos] = 2  # REPLACE
+            # Gold Template: 替换位置放[MASK]
+            for i in range(n):
+                if i == edit_pos:
+                    template_tokens.append('[MASK]')
+                    gold_tokens.append(edit.original_char)  # 正确的字
+                    mask_positions.append(len(template_tokens) - 1)
+                else:
+                    template_tokens.append(source[i])
+        
+        # 如果template还是空（不应该发生），设为source
+        if not template_tokens:
+            template_tokens = list(source)
+        
+        return {
+            'op_labels': op_labels,
+            'insert_labels': insert_labels,
+            'template_tokens': template_tokens,
+            'gold_tokens': gold_tokens,
+            'mask_positions': mask_positions,
+        }
+    
+    def _generate_positive_labels(self, sentence: str) -> Dict[str, Any]:
+        """为正例生成标签（所有位置都是KEEP，无MASK）"""
+        n = len(sentence)
+        return {
+            'op_labels': [0] * n,
+            'insert_labels': [0] * n,
+            'template_tokens': list(sentence),
+            'gold_tokens': [],
+            'mask_positions': [],
+        }
+
+    def generate_samples_for_sentence(
+        self, 
+        clean_sentence: str, 
+        rng: Optional[random.Random] = None
+    ) -> List[Dict[str, Any]]:
+        """为单个句子生成样本：1正例 + N负例，包含预计算的标签"""
+        _random = rng if rng is not None else random
+        samples = []
+        
+        # 正例（source == target）
+        pos_labels = self._generate_positive_labels(clean_sentence)
+        samples.append({
+            'source': clean_sentence,
+            'target': clean_sentence,
+            **pos_labels,  # 包含op_labels, insert_labels等
+        })
+        
+        # 采样不同的错误类型
+        selected_types = self._sample_error_types(
+            self.config.num_negative_per_sentence, _random
+        )
+        
+        # 生成负例
+        for error_type in selected_types:
+            result = self.error_generator.corrupt_with_type(
+                clean_sentence, error_type, rng=_random
+            )
+            
+            if result.is_corrupted and result.edits:
+                edit = result.edits[0]  # 只有一个错误
+                labels = self._generate_labels_from_edit(
+                    source=result.corrupted,
+                    target=result.original,
+                    edit=edit,
+                )
+                samples.append({
+                    'source': result.corrupted,
+                    'target': result.original,
+                    **labels,
+                })
+            else:
+                # 回退到其他类型
+                for fallback in self.ERROR_TYPES:
+                    if fallback != error_type:
+                        result = self.error_generator.corrupt_with_type(
+                            clean_sentence, fallback, rng=_random
+                        )
+                        if result.is_corrupted and result.edits:
+                            edit = result.edits[0]
+                            labels = self._generate_labels_from_edit(
+                                source=result.corrupted,
+                                target=result.original,
+                                edit=edit,
+                            )
+                            samples.append({
+                                'source': result.corrupted,
+                                'target': result.original,
+                                **labels,
+                            })
+                            break
+        
+        return samples
     
     def generate_and_save(
         self,
@@ -283,294 +433,129 @@ class TrainingDataGenerator:
         train_ratio: float = 0.8,
         dev_ratio: float = 0.1,
         test_ratio: float = 0.1,
-        output_format: str = "jsonl",
         shuffle: bool = True,
         seed: Optional[int] = None,
         show_progress: bool = True,
     ) -> Dict[str, str]:
-        """
-        生成训练数据并保存
-        
-        Args:
-            clean_sentences: 干净句子列表
-            output_dir: 输出目录
-            train_ratio: 训练集比例
-            dev_ratio: 验证集比例
-            test_ratio: 测试集比例
-            output_format: 输出格式 ("jsonl", "tsv", "json")
-            shuffle: 是否打乱数据
-            seed: 随机种子
-            show_progress: 是否显示进度
-            
-        Returns:
-            输出文件路径字典
-        """
-        # 验证比例
-        total_ratio = train_ratio + dev_ratio + test_ratio
-        if abs(total_ratio - 1.0) > 1e-6:
-            train_ratio /= total_ratio
-            dev_ratio /= total_ratio
-            test_ratio /= total_ratio
-        
-        # 设置随机种子
+        """生成并保存数据集"""
         if seed is not None:
             random.seed(seed)
+        rng = random.Random(seed) if seed is not None else random
         
-        # 打乱数据
+        # 归一化比例
+        total = train_ratio + dev_ratio + test_ratio
+        train_ratio, dev_ratio, test_ratio = train_ratio/total, dev_ratio/total, test_ratio/total
+        
+        # 句子层面划分
+        sentences = clean_sentences.copy()
         if shuffle:
-            sentences = clean_sentences.copy()
-            random.shuffle(sentences)
-        else:
-            sentences = clean_sentences
+            rng.shuffle(sentences)
         
-        # 划分数据集
         n = len(sentences)
-        n_train = int(n * train_ratio)
-        n_dev = int(n * dev_ratio)
+        n_train, n_dev = int(n * train_ratio), int(n * dev_ratio)
         
-        train_sentences = sentences[:n_train]
-        dev_sentences = sentences[n_train:n_train + n_dev]
-        test_sentences = sentences[n_train + n_dev:]
+        train_sents = sentences[:n_train]
+        dev_sents = sentences[n_train:n_train + n_dev]
+        test_sents = sentences[n_train + n_dev:]
         
-        print(f"Data split: train={len(train_sentences)}, dev={len(dev_sentences)}, test={len(test_sentences)}")
+        print(f"句子划分: train={len(train_sents)}, dev={len(dev_sents)}, test={len(test_sents)}")
+        print(f"每句生成: 1正例 + {self.config.num_negative_per_sentence}负例")
         
-        # 生成各数据集
-        print("Generating training data...")
-        train_results = self.augmentor.augment_batch(train_sentences, show_progress)
+        # 生成样本
+        train_samples = self._generate_split(train_sents, rng, show_progress, "train")
+        dev_samples = self._generate_split(dev_sents, rng, show_progress, "dev")
+        test_samples = self._generate_split(test_sents, rng, show_progress, "test")
         
-        print("Generating dev data...")
-        dev_results = self.augmentor.augment_batch(dev_sentences, show_progress)
+        # 样本层面打乱
+        if shuffle:
+            rng.shuffle(train_samples)
+            rng.shuffle(dev_samples)
+            rng.shuffle(test_samples)
         
-        print("Generating test data...")
-        test_results = self.augmentor.augment_batch(test_sentences, show_progress)
-        
-        # 创建输出目录
+        # 保存
         os.makedirs(output_dir, exist_ok=True)
-        
-        # 保存数据
-        output_files = {}
-        
-        output_files['train'] = self._save_results(
-            train_results, os.path.join(output_dir, f"train.{output_format}"), output_format
-        )
-        output_files['dev'] = self._save_results(
-            dev_results, os.path.join(output_dir, f"dev.{output_format}"), output_format
-        )
-        output_files['test'] = self._save_results(
-            test_results, os.path.join(output_dir, f"test.{output_format}"), output_format
-        )
-        
-        # 保存统计信息
-        stats = {
-            'train': self.augmentor.get_stats(train_results),
-            'dev': self.augmentor.get_stats(dev_results),
-            'test': self.augmentor.get_stats(test_results),
-            'config': self.augmentor.config.to_dict(),
+        output_files = {
+            'train': self._save(train_samples, os.path.join(output_dir, "train.jsonl")),
+            'dev': self._save(dev_samples, os.path.join(output_dir, "dev.jsonl")),
+            'test': self._save(test_samples, os.path.join(output_dir, "test.jsonl")),
         }
         
+        # 统计信息
+        stats = {
+            'config': self.config.to_dict(),
+            'sentence_split': {'train': len(train_sents), 'dev': len(dev_sents), 'test': len(test_sents)},
+            'sample_stats': {
+                'train': self._stats(train_samples),
+                'dev': self._stats(dev_samples),
+                'test': self._stats(test_samples),
+            },
+        }
         stats_file = os.path.join(output_dir, "stats.json")
         with open(stats_file, 'w', encoding='utf-8') as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
         output_files['stats'] = stats_file
         
-        print(f"\nGeneration complete!")
-        print(f"  Train corruption rate: {stats['train']['corruption_rate']:.2%}")
-        print(f"  Dev corruption rate: {stats['dev']['corruption_rate']:.2%}")
-        print(f"  Test corruption rate: {stats['test']['corruption_rate']:.2%}")
-        
+        print(f"\n完成！train={len(train_samples)}, dev={len(dev_samples)}, test={len(test_samples)}")
         return output_files
     
-    def _save_results(
-        self,
-        results: List[CorruptionResult],
-        file_path: str,
-        output_format: str
-    ) -> str:
-        """保存结果到文件"""
+    def _generate_split(self, sentences, rng, show_progress, name):
+        samples = []
+        iterator = sentences
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(sentences, desc=f"生成{name}")
+            except ImportError:
+                pass
+        for sent in iterator:
+            samples.extend(self.generate_samples_for_sentence(sent, rng))
+        return samples
+    
+    def _save(self, samples, path):
+        with open(path, 'w', encoding='utf-8') as f:
+            for s in samples:
+                f.write(json.dumps(s, ensure_ascii=False) + '\n')
+        print(f"保存 {len(samples)} 样本到 {path}")
+        return path
+    
+    def _stats(self, samples):
+        total = len(samples)
+        positive = sum(1 for s in samples if not s.get('gold_tokens'))
+        negative = total - positive
         
-        with open(file_path, 'w', encoding='utf-8') as f:
-            if output_format == "jsonl":
-                for r in results:
-                    line = json.dumps({
-                        'source': r.corrupted,      # 错误句（模型输入）
-                        'target': r.original,       # 正确句（模型目标）
-                        'is_corrupted': r.is_corrupted,
-                        'num_edits': len(r.edits),
-                    }, ensure_ascii=False)
-                    f.write(line + '\n')
+        # 统计错误类型（通过label推断）
+        type_counts = {'S': 0, 'M': 0, 'R': 0}
+        for s in samples:
+            op_labels = s.get('op_labels', [])
+            insert_labels = s.get('insert_labels', [])
             
-            elif output_format == "tsv":
-                for r in results:
-                    f.write(f"{r.corrupted}\t{r.original}\n")
-            
-            elif output_format == "json":
-                data = [
-                    {
-                        'source': r.corrupted,
-                        'target': r.original,
-                        'is_corrupted': r.is_corrupted,
-                        'num_edits': len(r.edits),
-                    }
-                    for r in results
-                ]
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            if any(ins > 0 for ins in insert_labels):
+                type_counts['S'] += 1  # 有插入标签 → 原来是SKIP造错
+            elif 1 in op_labels:
+                type_counts['M'] += 1  # 有DELETE标签 → 原来是MULTIPLY造错
+            elif 2 in op_labels:
+                type_counts['R'] += 1  # 有REPLACE标签 → 原来是REPLACE造错
         
-        print(f"Saved {len(results)} samples to {file_path}")
-        return file_path
-
-
-# 便捷函数
-def create_augmentor(
-    p_corrupt: float = 0.7,
-    lambda_: float = 1.5,
-    pi_skip: float = 0.2,
-    pi_multiply: float = 0.3,
-    pi_replace: float = 0.5,
-    **kwargs
-) -> DataAugmentor:
-    """创建数据增强器"""
-    config = AugmentationConfig(
-        p_corrupt=p_corrupt,
-        lambda_=lambda_,
-        pi_skip=pi_skip,
-        pi_multiply=pi_multiply,
-        pi_replace=pi_replace,
-        **kwargs
-    )
-    return DataAugmentor(config)
-
-
-def generate_training_data(
-    clean_file: str,
-    output_dir: str,
-    p_corrupt: float = 0.7,
-    lambda_: float = 1.5,
-    pi_skip: float = 0.2,
-    pi_multiply: float = 0.3,
-    pi_replace: float = 0.5,
-    train_ratio: float = 0.8,
-    dev_ratio: float = 0.1,
-    test_ratio: float = 0.1,
-    file_format: str = "txt",
-    output_format: str = "jsonl",
-    seed: Optional[int] = None,
-    **kwargs
-) -> Dict[str, str]:
-    """
-    一键生成训练数据
+        return {
+            'total': total,
+            'positive': positive,
+            'negative': negative,
+            'error_types': type_counts,
+        }
     
-    Args:
-        clean_file: 干净语料文件路径
-        output_dir: 输出目录
-        p_corrupt: 造错概率
-        lambda_: 泊松参数
-        pi_skip: 删字概率
-        pi_multiply: 重复字概率
-        pi_replace: 错字概率
-        train_ratio: 训练集比例
-        dev_ratio: 验证集比例
-        test_ratio: 测试集比例
-        file_format: 输入文件格式
-        output_format: 输出文件格式
-        seed: 随机种子
-        **kwargs: 其他配置参数
-        
-    Returns:
-        输出文件路径字典
-    """
-    config = AugmentationConfig(
-        p_corrupt=p_corrupt,
-        lambda_=lambda_,
-        pi_skip=pi_skip,
-        pi_multiply=pi_multiply,
-        pi_replace=pi_replace,
-        seed=seed,
-        **kwargs
-    )
-    
-    augmentor = DataAugmentor(config)
-    generator = TrainingDataGenerator(augmentor)
-    
-    # 加载干净句子
-    sentences = generator.load_clean_sentences(clean_file, file_format)
-    print(f"Loaded {len(sentences)} clean sentences from {clean_file}")
-    
-    # 生成并保存
-    return generator.generate_and_save(
-        clean_sentences=sentences,
-        output_dir=output_dir,
-        train_ratio=train_ratio,
-        dev_ratio=dev_ratio,
-        test_ratio=test_ratio,
-        output_format=output_format,
-        seed=seed,
-    )
-
-
-def grid_search_params(
-    clean_sentences: List[str],
-    eval_sentences: List[str],
-    eval_fn,
-    p_corrupt_range: List[float] = [0.3, 0.5, 0.7],
-    lambda_range: List[float] = [1.0, 1.5, 2.0],
-    pi_multiply_range: List[float] = [0.3, 0.5, 0.7],
-    max_combinations: int = 27,
-    seed: Optional[int] = 42,
-) -> List[Dict[str, Any]]:
-    """
-    网格搜索最佳参数
-    
-    Args:
-        clean_sentences: 用于训练的干净句子
-        eval_sentences: 用于评估的句子
-        eval_fn: 评估函数，接受 (train_data, eval_data) 返回 score
-        p_corrupt_range: 造错概率搜索范围
-        lambda_range: 泊松参数搜索范围
-        pi_multiply_range: 重复字概率搜索范围
-        max_combinations: 最大组合数
-        seed: 随机种子
-        
-    Returns:
-        排序后的参数和得分列表
-    """
-    from itertools import product
-    
-    results = []
-    combinations = list(product(p_corrupt_range, lambda_range, pi_multiply_range))
-    
-    if len(combinations) > max_combinations:
-        combinations = random.sample(combinations, max_combinations)
-    
-    for p_corrupt, lambda_, pi_multiply in combinations:
-        pi_skip = (1 - pi_multiply) / 2
-        pi_replace = (1 - pi_multiply) / 2
-        
-        config = AugmentationConfig(
-            p_corrupt=p_corrupt,
-            lambda_=lambda_,
-            pi_skip=pi_skip,
-            pi_multiply=pi_multiply,
-            pi_replace=pi_replace,
-            seed=seed,
-        )
-        
-        augmentor = DataAugmentor(config)
-        train_data = augmentor.generate_training_pairs(clean_sentences)
-        
-        score = eval_fn(train_data, eval_sentences)
-        
-        results.append({
-            'params': {
-                'p_corrupt': p_corrupt,
-                'lambda_': lambda_,
-                'pi_skip': pi_skip,
-                'pi_multiply': pi_multiply,
-                'pi_replace': pi_replace,
-            },
-            'score': score,
-        })
-    
-    # 按得分排序
-    results.sort(key=lambda x: x['score'], reverse=True)
-    
-    return results
+    @staticmethod
+    def load_sentences(file_path: str, file_format: str = "txt") -> List[str]:
+        """加载句子文件"""
+        sentences = []
+        with open(file_path, 'r', encoding='utf-8') as f:
+            if file_format == "txt":
+                sentences = [line.strip() for line in f if line.strip()]
+            elif file_format == "jsonl":
+                for line in f:
+                    if line.strip():
+                        data = json.loads(line)
+                        if isinstance(data, str):
+                            sentences.append(data)
+                        elif isinstance(data, dict):
+                            sentences.append(data.get('text', data.get('source', '')))
+        return sentences

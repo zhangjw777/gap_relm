@@ -153,6 +153,8 @@ def parse_args():
                         help="Alignment algorithm")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of data loading workers")
+    parser.add_argument("--prefetch_factor", type=int, default=2,
+                        help="Number of batches to prefetch per worker (increase for faster data loading)")
     parser.add_argument("--cache_dir", type=str, default="./cache",
                         help="Cache directory")
     parser.add_argument("--no_cache", action="store_true",
@@ -378,6 +380,7 @@ def main():
             data_format=args.data_format,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
             normalize_text=True,
             enable_aux_mlm=config.ablation.enable_aux_mlm,
             # 在线增强参数
@@ -421,6 +424,7 @@ def main():
             data_format=args.data_format,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
             cache_dir=args.cache_dir,
             use_cache=not args.no_cache,
             enable_aux_mlm=config.ablation.enable_aux_mlm,

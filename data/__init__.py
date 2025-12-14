@@ -49,10 +49,8 @@ from .error_generator import (
 from .augmentation import (
     AugmentationConfig,
     DataAugmentor,
-    TrainingDataGenerator,
-    create_augmentor,
-    generate_training_data,
-    grid_search_params,
+    StaticDataGenerator,
+    StaticSampleConfig,
 )
 
 
@@ -104,11 +102,9 @@ __all__ = [
     "create_conservative_error_generator",
     "create_aggressive_error_generator",
     
-    # 数据增强管道
+    # 数据增强
     "AugmentationConfig",
     "DataAugmentor",
-    "TrainingDataGenerator",
-    "create_augmentor",
-    "generate_training_data",
-    "grid_search_params",
+    "StaticDataGenerator",
+    "StaticSampleConfig",
 ]

@@ -366,6 +366,77 @@ class ErrorGenerator:
         
         return ErrorType.REPLACE  # 默认
     
+    def corrupt_with_type(
+        self,
+        sentence: str,
+        error_type: ErrorType,
+        rng: Optional[random.Random] = None
+    ) -> CorruptionResult:
+        """
+        使用指定的错误类型对句子造单个错误
+        
+        Args:
+            sentence: 正确的原始句子
+            error_type: 指定的错误类型 (SKIP, MULTIPLY, REPLACE)
+            rng: 可选的随机数生成器
+            
+        Returns:
+            CorruptionResult，包含恰好1个指定类型的错误
+        """
+        _random = rng if rng is not None else random
+        
+        # 检查是否太短
+        if len(sentence) < self.min_sentence_length:
+            return CorruptionResult(
+                original=sentence,
+                corrupted=sentence,
+                edits=[],
+                is_corrupted=False
+            )
+        
+        # 获取可编辑位置
+        editable_positions = self._get_editable_positions(sentence)
+        
+        # 对于替换类型，需要进一步筛选有混淆字符的位置
+        if error_type == ErrorType.REPLACE:
+            valid_positions = [
+                pos for pos in editable_positions
+                if self.confusion_set.get_random_confusion(sentence[pos], rng=_random) is not None
+            ]
+            # 如果没有可替换的位置，回退到原始可编辑位置
+            if valid_positions:
+                editable_positions = valid_positions
+        
+        if not editable_positions:
+            return CorruptionResult(
+                original=sentence,
+                corrupted=sentence,
+                edits=[],
+                is_corrupted=False
+            )
+        
+        # 随机选择一个位置
+        pos = _random.choice(editable_positions)
+        
+        # 应用指定类型的错误
+        corrupted = list(sentence)
+        edit = self._apply_error(corrupted, pos, error_type, _random)
+        
+        if edit:
+            return CorruptionResult(
+                original=sentence,
+                corrupted=''.join(corrupted),
+                edits=[edit],
+                is_corrupted=True
+            )
+        else:
+            return CorruptionResult(
+                original=sentence,
+                corrupted=sentence,
+                edits=[],
+                is_corrupted=False
+            )
+    
     def _apply_error(
         self,
         chars: List[str],
