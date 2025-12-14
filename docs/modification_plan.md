@@ -4,7 +4,67 @@
 
 ---
 
-## 零、导入路径修复（2025-12-14 修复 ✅）
+## 〇、关键缺陷修复与 API 更新（2025-12-14 修复 ✅）
+
+### 0.1 Scheduled Sampling 逻辑缺陷修复
+
+**问题描述**：
+在 `trainers/trainer.py` 的 `_apply_scheduled_sampling` 方法中存在严重逻辑缺陷：
+- 当使用 Planner 预测的模板替换 Gold Template 时，模板长度和 [MASK] 位置会发生变化
+- 但 `infill_labels` 仍然是基于 Gold Template 生成的标签
+- 两者长度不一致，传入 CrossEntropyLoss 时会导致形状不匹配
+- 在某些 CUDA 环境下，这种不匹配会直接导致 `CUDA driver error: unknown error`
+
+**修复方案**：
+1. 修改 `_apply_scheduled_sampling` 方法签名，返回 `Tuple[Dict, bool]`
+2. 第二个返回值 `skip_infiller_loss` 标识是否跳过 Infiller Loss
+3. 当使用预测模板时，设置 `skip_infiller_loss=True`
+4. 在前向传播时，如果 `skip_infiller_loss=True`，传入 `infill_labels=None`
+5. 此时只计算 Planner Loss，符合 Scheduled Sampling 的设计目的
+
+**修改文件**：`trainers/trainer.py`
+
+### 0.2 PyTorch AMP API 更新
+
+**问题描述**：
+`torch.cuda.amp.autocast` 和 `torch.cuda.amp.GradScaler` 已弃用，需要使用新 API。
+
+**修复方案**：
+```python
+# 旧 API (已弃用)
+from torch.cuda.amp import autocast, GradScaler
+with autocast(enabled=..., dtype=...):
+scaler = GradScaler()
+
+# 新 API
+from torch.amp import autocast, GradScaler
+with autocast('cuda', enabled=..., dtype=...):
+scaler = GradScaler('cuda')
+```
+
+**修改文件**：`trainers/trainer.py`
+
+### 0.3 BatchSize 与显存分析
+
+**双 4090 (24GB×2) + MacBERT-base + BatchSize=128 显存估算**：
+
+| 组件 | FP16 估算 |
+|------|----------|
+| 模型参数 | ~204 MB |
+| 梯度 | ~204 MB |
+| 优化器状态 (Adam) | ~816 MB |
+| 激活值 (128 × 128 × 768 × 12层) | ~12-15 GB |
+| 临时缓冲区 | ~1-2 GB |
+| **总计** | **~15-18 GB/GPU** |
+
+**建议**：
+- 如果 `batch_size=128` 出现 OOM，建议降到 `batch_size=64` 或 `batch_size=32`
+- 使用 `gradient_accumulation_steps=4` 来等效获得更大的有效批次
+- 确认没有其他进程占用 GPU 显存
+
+---
+
+## 零-1、导入路径修复（2025-12-14 修复 ✅）
 
 ### 0.0 问题
 由于项目根目录本身就叫 `gap_relm`，而代码中使用了 `from gap_relm.xxx` 的导入方式，导致在服务器上运行时出现 `ModuleNotFoundError: No module named 'gap_relm'`。

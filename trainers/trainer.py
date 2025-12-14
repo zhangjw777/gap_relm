@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from models import GapReLMModel
@@ -108,7 +108,7 @@ class GapReLMTrainer:
         # 混合精度
         self.use_amp = self.training_config.fp16 or self.training_config.bf16
         self.amp_dtype = torch.bfloat16 if self.training_config.bf16 else torch.float16
-        self.scaler = GradScaler() if self.training_config.fp16 else None
+        self.scaler = GradScaler('cuda') if self.training_config.fp16 else None
         
         # 优化器和调度器
         self.optimizer = None
@@ -324,14 +324,15 @@ class GapReLMTrainer:
             batch = self._move_batch_to_device(batch)
             
             # Scheduled Sampling
+            skip_infiller_loss = False
             if use_scheduled_sampling and self.ss_scheduler:
                 use_predicted = self.ss_scheduler.should_use_predicted_template()
                 if use_predicted:
-                    batch = self._apply_scheduled_sampling(batch)
+                    batch, skip_infiller_loss = self._apply_scheduled_sampling(batch)
                 self.ss_scheduler.step()
             
             # 前向传播
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
@@ -339,7 +340,7 @@ class GapReLMTrainer:
                     insert_labels=batch['insert_labels'],
                     template_input_ids=batch['template_input_ids'],
                     template_attention_mask=batch['template_attention_mask'],
-                    infill_labels=batch['infill_labels'],
+                    infill_labels=None if skip_infiller_loss else batch['infill_labels'],
                     aux_mlm_labels=batch.get('aux_mlm_labels'),
                     training_stage=training_stage,
                 )
@@ -423,7 +424,7 @@ class GapReLMTrainer:
             for batch in tqdm(self.dev_loader, desc="Evaluating", disable=not self.is_main_process):
                 batch = self._move_batch_to_device(batch)
                 
-                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(
                         input_ids=batch['input_ids'],
                         attention_mask=batch['attention_mask'],
@@ -461,10 +462,16 @@ class GapReLMTrainer:
                 result[key] = value
         return result
     
-    def _apply_scheduled_sampling(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_scheduled_sampling(self, batch: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         """
         应用 Scheduled Sampling
         使用 Planner 预测的模板替换 Gold Template
+        
+        Returns:
+            batch: 更新后的 batch（如果使用预测模板）
+            skip_infiller_loss: 是否跳过 Infiller 损失计算
+                - 当使用预测模板时，由于 infill_labels 与新模板位置不对应，
+                  必须跳过 Infiller Loss 以避免形状不匹配导致 CUDA 错误
         """
         # 获取 Planner 预测
         with torch.no_grad():
@@ -496,16 +503,22 @@ class GapReLMTrainer:
         if template_result is None or template_result.template_ids is None:
             # 模板构建失败，保持使用原始模板（Gold Template）
             logger.warning("Template building failed in scheduled sampling, using original template")
-            return batch
+            return batch, False  # 使用原始模板，不需要跳过 Infiller Loss
         
-        # 更新 batch
+        # 更新 batch 使用预测模板
         batch['template_input_ids'] = template_result.template_ids
         batch['template_attention_mask'] = template_result.template_mask
         
-        # 注意：infill_labels 需要根据新模板重新计算
-        # 这里简化处理，保持原标签（实际应用中可能需要更复杂的处理）
-        
-        return batch
+        # 关键修复：当使用预测模板时，由于以下原因必须跳过 Infiller Loss：
+        # 1. infill_labels 是基于 Gold Template 位置生成的
+        # 2. 预测模板的长度和 [MASK] 位置与 Gold Template 不同
+        # 3. 将不匹配的 labels 传入 CrossEntropyLoss 会导致形状不匹配
+        # 4. 在某些 CUDA 环境下，这种不匹配会触发 "CUDA driver error: unknown error"
+        #
+        # Scheduled Sampling 的目的是让模型适应自己的预测模板，
+        # 此时只计算 Planner Loss（基于原始输入），跳过 Infiller Loss 是合理的
+        logger.debug("Using predicted template in scheduled sampling, skipping infiller loss")
+        return batch, True  # 使用预测模板，需要跳过 Infiller Loss
     
     def _log_training_step(self, outputs, step):
         """记录训练步骤日志"""

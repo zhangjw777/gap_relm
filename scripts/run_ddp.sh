@@ -15,8 +15,8 @@ DATA_FORMAT="mucgec"                       # 数据格式（mucgec/sighan/ecspel
 # ========== 训练策略 ==========
 TRAINING_STAGE="joint_finetune"            # 训练阶段（joint_finetune=联合训练）
 NUM_EPOCHS=10                              # 训练轮数
-BATCH_SIZE=128                              # 每个GPU的batch size
-GRADIENT_ACCUMULATION_STEPS=1              # 梯度累积步数
+BATCH_SIZE=64                              # 每个GPU的batch size
+GRADIENT_ACCUMULATION_STEPS=2              # 梯度累积步数
 
 # ========== 优化器参数 ==========
 LEARNING_RATE=2e-5                         # 学习率
