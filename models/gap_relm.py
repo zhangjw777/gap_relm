@@ -355,6 +355,11 @@ class GapReLMModel(nn.Module):
         
         # Infiller 前向
         if training_stage in ["infiller", "joint"] and template_input_ids is not None:
+            # 注意：aux_mlm_labels 是基于源序列生成的，形状是 [batch, seq_len]
+            # 但 Infiller 的输入是模板序列，形状可能是 [batch, template_len]
+            # 两者长度可能不同，因此 aux_mlm_loss 应该在源序列上单独计算，
+            # 而不是传给 Infiller（Infiller 只计算 infill_loss）
+            
             # 如果启用 P-Tuning，需要先编码模板
             if self.ablation_config.enable_ptuning:
                 infiller_hidden = self._encode_with_ptuning(
@@ -366,7 +371,7 @@ class GapReLMModel(nn.Module):
                     inputs_embeds=infiller_hidden,
                     attention_mask=template_attention_mask,
                     labels=infill_labels,
-                    aux_mlm_labels=aux_mlm_labels,
+                    aux_mlm_labels=None,  # 不在模板上计算 aux_mlm_loss
                     aux_mlm_weight=self.config.training.mu_aux,
                 )
             else:
@@ -374,10 +379,25 @@ class GapReLMModel(nn.Module):
                     input_ids=template_input_ids,
                     attention_mask=template_attention_mask,
                     labels=infill_labels,
-                    aux_mlm_labels=aux_mlm_labels,
+                    aux_mlm_labels=None,  # 不在模板上计算 aux_mlm_loss
                     aux_mlm_weight=self.config.training.mu_aux,
                 )
             infiller_loss = infiller_output.total_loss
+            
+            # 单独在源序列上计算辅助 MLM 损失
+            if aux_mlm_labels is not None and self.ablation_config.enable_aux_mlm:
+                # 使用已编码的 encoder_hidden (源序列)
+                aux_logits = self.infiller.lm_head(encoder_hidden)  # [batch, seq_len, vocab]
+                aux_mlm_loss = torch.nn.functional.cross_entropy(
+                    aux_logits.view(-1, self.model_config.vocab_size),
+                    aux_mlm_labels.view(-1),
+                    ignore_index=-100
+                )
+                # 将 aux_mlm_loss 加到 infiller_loss
+                if infiller_loss is not None:
+                    infiller_loss = infiller_loss + self.config.training.mu_aux * aux_mlm_loss
+                else:
+                    infiller_loss = self.config.training.mu_aux * aux_mlm_loss
         
         # 计算总损失
         if planner_loss is not None and infiller_loss is not None:

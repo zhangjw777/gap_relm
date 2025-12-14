@@ -44,7 +44,31 @@ scaler = GradScaler('cuda')
 
 **修改文件**：`trainers/trainer.py`
 
-### 0.3 BatchSize 与显存分析
+### 0.3 辅助 MLM 损失维度不匹配修复
+
+**问题描述**：
+运行时报错：`ValueError: Expected input batch_size (7616) to match target batch_size (8192)`
+- 位置：`models/infiller.py` 第 132 行的 `aux_mlm_loss` 计算
+- 原因：`aux_mlm_labels` 是基于源序列生成的，形状 `[batch, seq_len=128]`
+- 但 Infiller 的输入是模板序列，logits 形状 `[batch, template_len, vocab]`
+- 当模板长度 ≠ 源序列长度时（例如 119 vs 128），会导致维度不匹配
+
+**修复方案**：
+1. Infiller 只计算 `infill_loss`（基于模板序列）
+2. `aux_mlm_loss` 单独在源序列上计算（使用 `encoder_hidden`）
+3. 最后将两个损失相加
+
+**修改文件**：`models/gap_relm.py`
+
+```python
+# 修复后：aux_mlm_loss 在源序列上单独计算
+if aux_mlm_labels is not None and self.ablation_config.enable_aux_mlm:
+    aux_logits = self.infiller.lm_head(encoder_hidden)  # [batch, seq_len, vocab]
+    aux_mlm_loss = F.cross_entropy(aux_logits.view(-1, vocab), aux_mlm_labels.view(-1), ignore_index=-100)
+    infiller_loss = infiller_loss + mu_aux * aux_mlm_loss
+```
+
+### 0.4 BatchSize 与显存分析
 
 **双 4090 (24GB×2) + MacBERT-base + BatchSize=128 显存估算**：
 
