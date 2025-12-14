@@ -4,12 +4,36 @@
 
 ---
 
-## 零、代码质量改进（2025-12-14 新增 ✅）
+## 零、导入路径修复（2025-12-14 修复 ✅）
 
-### 0.1 背景
+### 0.0 问题
+由于项目根目录本身就叫 `gap_relm`，而代码中使用了 `from gap_relm.xxx` 的导入方式，导致在服务器上运行时出现 `ModuleNotFoundError: No module named 'gap_relm'`。
+
+### 0.1 修复
+修改所有脚本的导入语句，去掉 `gap_relm.` 前缀：
+
+| 文件 | 修改前 | 修改后 | 状态 |
+|------|--------|--------|------|
+| `scripts/generate_frozen_dev.py` | `from gap_relm.data.augmentation import ...` | `from data.augmentation import ...` | ✅ |
+| `scripts/train.py` | `from gap_relm.config import ...` | `from config import ...` | ✅ |
+| `scripts/generate_training_data.py` | `from gap_relm.data.augmentation import ...` | `from data.augmentation import ...` | ✅ |
+| `scripts/predict.py` | `from gap_relm.inference import ...` | `from inference import ...` | ✅ |
+
+现在可以直接在项目根目录运行脚本：
+```bash
+cd /path/to/gap_relm
+python scripts/generate_frozen_dev.py ...
+python scripts/train.py ...
+```
+
+---
+
+## 一、代码质量改进（2025-12-14 新增 ✅）
+
+### 1.1 背景
 在代码检查过程中发现了5个潜在问题，这些问题不会影响正常运行，但在边界条件下可能导致错误或不一致。
 
-### 0.2 修复的问题
+### 1.2 修复的问题
 
 | 问题 | 位置 | 修复内容 | 状态 |
 |------|------|---------|------|
@@ -19,7 +43,7 @@
 | **混合精度配置冲突** | `scripts/train.py` | 添加fp16和bf16互斥检查，禁止同时使用 | ✅ |
 | **模板构建空指针** | `trainers/trainer.py` | 在scheduled sampling中检查template_result是否为None | ✅ |
 
-### 0.3 详细修改
+### 1.3 详细修改
 
 #### 1. 随机种子可控性（最重要）
 **修改文件**：

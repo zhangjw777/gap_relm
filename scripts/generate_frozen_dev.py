@@ -36,7 +36,7 @@ import random
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gap_relm.data.augmentation import DataAugmentor, AugmentationConfig
+from data.augmentation import DataAugmentor, AugmentationConfig
 
 
 def parse_args():

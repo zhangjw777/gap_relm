@@ -14,10 +14,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gap_relm.config import GapReLMConfig, get_config
-from gap_relm.models import GapReLMModel
-from gap_relm.data import create_data_loaders, create_online_data_loaders
-from gap_relm.trainers import GapReLMTrainer
+from config import GapReLMConfig, get_config
+from models import GapReLMModel
+from data import create_data_loaders, create_online_data_loaders
+from trainers import GapReLMTrainer
 
 
 def setup_logging(log_level: str = "INFO"):

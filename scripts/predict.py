@@ -13,7 +13,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from gap_relm.inference import GapReLMPipeline, CorrectionResult
+from inference import GapReLMPipeline, CorrectionResult
 
 
 def parse_args():

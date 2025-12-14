@@ -7,7 +7,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gap_relm.data.augmentation import DataAugmentor, AugmentationConfig, TrainingDataGenerator
+from data.augmentation import DataAugmentor, AugmentationConfig, TrainingDataGenerator
 
 
 def example_1_basic_usage():
