@@ -326,6 +326,7 @@ class GapReLMModel(nn.Module):
             GapReLMOutput
         """
         device = input_ids.device
+        batch_size = input_ids.shape[0]
         self._move_weights_to_device(device)
         
         # 编码源序列（带 P-Tuning）
@@ -340,6 +341,18 @@ class GapReLMModel(nn.Module):
         planner_loss = None
         infiller_loss = None
         total_loss = None
+        
+        # DDP 兼容性：确保所有 P-Tuning 参数都参与梯度计算
+        # 当只训练 Planner 时，infiller_ptuning 没有被使用；反之亦然
+        # 添加一个 0 权重的 dummy loss 来确保梯度流动
+        ptuning_dummy_loss = torch.tensor(0.0, device=device)
+        if self.ablation_config.enable_ptuning and not self.ablation_config.ptuning_shared:
+            if self.planner_ptuning is not None:
+                planner_prompt = self.planner_ptuning(batch_size, device)
+                ptuning_dummy_loss = ptuning_dummy_loss + planner_prompt.sum() * 0.0
+            if self.infiller_ptuning is not None:
+                infiller_prompt = self.infiller_ptuning(batch_size, device)
+                ptuning_dummy_loss = ptuning_dummy_loss + infiller_prompt.sum() * 0.0
         
         # Planner 前向
         if training_stage in ["planner", "joint"]:
@@ -357,8 +370,7 @@ class GapReLMModel(nn.Module):
         if training_stage in ["infiller", "joint"] and template_input_ids is not None:
             # 注意：aux_mlm_labels 是基于源序列生成的，形状是 [batch, seq_len]
             # 但 Infiller 的输入是模板序列，形状可能是 [batch, template_len]
-            # 两者长度可能不同，因此 aux_mlm_loss 应该在源序列上单独计算，
-            # 而不是传给 Infiller（Infiller 只计算 infill_loss）
+            # 两者长度可能不同，因此 aux_mlm_loss 应该在源序列上单独计算
             
             # 如果启用 P-Tuning，需要先编码模板
             if self.ablation_config.enable_ptuning:
@@ -385,19 +397,30 @@ class GapReLMModel(nn.Module):
             infiller_loss = infiller_output.total_loss
             
             # 单独在源序列上计算辅助 MLM 损失
-            if aux_mlm_labels is not None and self.ablation_config.enable_aux_mlm:
+            # 注意：为了 DDP 梯度同步，即使 aux_mlm_labels 为 None 也需要计算（结果会被忽略）
+            if self.ablation_config.enable_aux_mlm:
                 # 使用已编码的 encoder_hidden (源序列)
                 aux_logits = self.infiller.lm_head(encoder_hidden)  # [batch, seq_len, vocab]
-                aux_mlm_loss = torch.nn.functional.cross_entropy(
-                    aux_logits.view(-1, self.model_config.vocab_size),
-                    aux_mlm_labels.view(-1),
-                    ignore_index=-100
-                )
-                # 将 aux_mlm_loss 加到 infiller_loss
-                if infiller_loss is not None:
-                    infiller_loss = infiller_loss + self.config.training.mu_aux * aux_mlm_loss
+                
+                if aux_mlm_labels is not None:
+                    aux_mlm_loss = torch.nn.functional.cross_entropy(
+                        aux_logits.view(-1, self.model_config.vocab_size),
+                        aux_mlm_labels.view(-1),
+                        ignore_index=-100
+                    )
+                    # 将 aux_mlm_loss 加到 infiller_loss
+                    if infiller_loss is not None:
+                        infiller_loss = infiller_loss + self.config.training.mu_aux * aux_mlm_loss
+                    else:
+                        infiller_loss = self.config.training.mu_aux * aux_mlm_loss
                 else:
-                    infiller_loss = self.config.training.mu_aux * aux_mlm_loss
+                    # 即使没有 aux_mlm_labels，也要让 aux_logits 参与计算以保证 DDP 梯度同步
+                    # 使用一个 0 权重的占位损失
+                    dummy_loss = aux_logits.sum() * 0.0
+                    if infiller_loss is not None:
+                        infiller_loss = infiller_loss + dummy_loss
+                    else:
+                        infiller_loss = dummy_loss
         
         # 计算总损失
         if planner_loss is not None and infiller_loss is not None:
@@ -406,6 +429,12 @@ class GapReLMModel(nn.Module):
             total_loss = planner_loss
         elif infiller_loss is not None:
             total_loss = infiller_loss
+        
+        # 添加 P-Tuning dummy loss 确保 DDP 梯度同步
+        if total_loss is not None:
+            total_loss = total_loss + ptuning_dummy_loss
+        else:
+            total_loss = ptuning_dummy_loss
         
         return GapReLMOutput(
             planner_output=planner_output,

@@ -68,7 +68,37 @@ if aux_mlm_labels is not None and self.ablation_config.enable_aux_mlm:
     infiller_loss = infiller_loss + mu_aux * aux_mlm_loss
 ```
 
-### 0.4 BatchSize 与显存分析
+### 0.4 DDP 梯度同步问题修复
+
+**问题描述**：
+运行时报错：`RuntimeError: Expected to have finished reduction in the prior iteration before starting a new one`
+- 原因：P-Tuning 有独立的 `planner_ptuning` 和 `infiller_ptuning`
+- 当 `training_stage="planner"` 时，`infiller_ptuning` 没有被使用
+- DDP 要求所有参数都参与 loss 计算
+
+**修复方案**：
+1. 在 forward 开始时，无论训练阶段如何，都调用两个 P-Tuning 模块
+2. 使用 `dummy_loss = prompt.sum() * 0.0` 确保梯度流动但不影响实际损失
+3. 将 dummy_loss 加到 total_loss 中
+
+**修改文件**：`models/gap_relm.py`
+
+```python
+# DDP 兼容性：确保所有 P-Tuning 参数都参与梯度计算
+ptuning_dummy_loss = torch.tensor(0.0, device=device)
+if self.ablation_config.enable_ptuning and not self.ablation_config.ptuning_shared:
+    if self.planner_ptuning is not None:
+        planner_prompt = self.planner_ptuning(batch_size, device)
+        ptuning_dummy_loss = ptuning_dummy_loss + planner_prompt.sum() * 0.0
+    if self.infiller_ptuning is not None:
+        infiller_prompt = self.infiller_ptuning(batch_size, device)
+        ptuning_dummy_loss = ptuning_dummy_loss + infiller_prompt.sum() * 0.0
+
+# 最后添加到 total_loss
+total_loss = total_loss + ptuning_dummy_loss
+```
+
+### 0.5 BatchSize 与显存分析
 
 **双 4090 (24GB×2) + MacBERT-base + BatchSize=128 显存估算**：
 
