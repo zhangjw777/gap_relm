@@ -17,8 +17,13 @@ from .dataset import (
     LengthAdaptiveLambda,
     load_clean_sentences,
     LazyGapReLMDataset,  # 内存友好的惰性加载数据集
+    TokenizedBinaryDataset,  # 最高效的预计算 tokenize 数据集
 )
-from .data_loader import create_data_loaders, create_online_data_loaders
+from .data_loader import (
+    create_data_loaders, 
+    create_online_data_loaders,
+    create_tokenized_data_loaders,  # 预计算 tokenize 数据加载器
+)
 
 # 数据增强模块（独立功能）
 from .confusion_set import (

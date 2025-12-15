@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import GapReLMConfig, get_config
 from models import GapReLMModel
-from data import create_data_loaders, create_online_data_loaders
+from data import create_data_loaders, create_online_data_loaders, create_tokenized_data_loaders
 from trainers import GapReLMTrainer
 
 
@@ -163,6 +163,17 @@ def parse_args():
     # ========== 惰性加载参数（大规模数据集内存优化） ==========
     parser.add_argument("--lazy_load", action="store_true",
                         help="Enable lazy loading for large precomputed datasets (memory-efficient, recommended for >1M samples)")
+    
+    # ========== 预计算 tokenize 数据参数（最高效模式） ==========
+    parser.add_argument("--tokenized_data", action="store_true",
+                        help="Use pre-tokenized binary data format (most efficient, recommended for large-scale training)")
+    parser.add_argument("--train_data_prefix", type=str, default=None,
+                        help="Path prefix for tokenized training data (without .bin/.idx suffix)")
+    parser.add_argument("--dev_data_prefix", type=str, default=None,
+                        help="Path prefix for tokenized dev data (without .bin/.idx suffix)")
+    parser.add_argument("--test_data_prefix", type=str, default=None,
+                        help="Path prefix for tokenized test data (without .bin/.idx suffix)")
+
     
     # ========== 在线动态数据增强参数 ==========
     parser.add_argument("--online_augment", action="store_true", default=True,
@@ -352,11 +363,32 @@ def main():
         logger.info(f"Output directory: {args.output_dir}")
         logger.info(f"Distributed: {is_distributed}, World size: {world_size if is_distributed else 1}")
     
-    # 确定是否使用在线数据增强
-    use_online_augment = args.online_augment and not args.no_online_augment
+    # 确定数据加载模式
+    use_tokenized_data = args.tokenized_data and args.train_data_prefix
+    use_online_augment = args.online_augment and not args.no_online_augment and not use_tokenized_data
     
     # 创建数据加载器
-    if use_online_augment:
+    if use_tokenized_data:
+        # 预计算 tokenize 模式（最高效）
+        if is_main_process:
+            logger.info("Using PRE-TOKENIZED binary data format (most efficient)")
+            logger.info(f"Train data prefix: {args.train_data_prefix}")
+            logger.info(f"Dev data prefix: {args.dev_data_prefix}")
+        
+        train_loader, dev_loader, _, tokenizer = create_tokenized_data_loaders(
+            train_prefix=args.train_data_prefix,
+            dev_prefix=args.dev_data_prefix,
+            test_prefix=args.test_data_prefix,
+            tokenizer_name=args.pretrained_model,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            enable_aux_mlm=config.ablation.enable_aux_mlm,
+            distributed=is_distributed,
+            world_size=world_size if is_distributed else 1,
+            rank=rank if is_distributed else 0,
+        )
+    elif use_online_augment:
         # 在线动态数据增强模式
         # 需要提供干净句子文件
         clean_train_file = args.clean_train_file or args.train_file

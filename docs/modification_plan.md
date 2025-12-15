@@ -1,6 +1,99 @@
 # Gap-ReLM 项目修改计划
 
-## 最后修改日期：2025-12-14
+## 最后修改日期：2025-12-15
+
+---
+
+## 〇-1、预计算 Tokenize 数据加载优化（2025-12-15 新增 ✅）
+
+### 问题背景
+使用 `LazyGapReLMDataset` 惰性加载 1000 万条预计算数据时，GPU 利用率严重不足：
+- 双 RTX 4090 功率只有 130W（满载应为 400W+）
+- 训练速度 1.45s/it，远低于预期
+- `htop` 显示 CPU 使用率过高，多个 Python 进程满载
+
+**根本原因**：`__getitem__` 中每个样本需要：
+1. `f.seek() + readline()` - 随机文件访问
+2. `json.loads()` - JSON 解析
+3. **tokenizer 调用 2 次**（source + template）- 最大瓶颈
+4. 创建多个 tensor、list 操作
+
+即使设置 `num_workers=16, prefetch_factor=4`，单个样本的处理开销太大，CPU 无法喂饱 GPU。
+
+### 解决方案
+将 tokenize 阶段从训练时移到数据生成阶段，训练时直接读取二进制 tensor。
+
+### 代码修改
+
+| 文件 | 修改类型 | 说明 |
+|------|----------|------|
+| `scripts/generate_tokenized_data.py` | **新增** | 将 JSONL 转换为预计算 tokenize 的二进制格式 |
+| `data/dataset.py` | **新增** | `TokenizedBinaryDataset` 类，使用 mmap 直接读取 tensor |
+| `data/data_loader.py` | **修改** | 添加 `create_tokenized_data_loaders()` 函数 |
+| `data/__init__.py` | **修改** | 导出新类和函数 |
+| `scripts/train.py` | **修改** | 添加 `--tokenized_data` 等命令行参数 |
+
+### 数据格式
+
+**二进制格式**（每样本固定 `max_seq_length * 10` 字节）：
+```
+.bin 文件：连续存储的二进制数据
+- input_ids: int16 * max_seq_length
+- attention_mask: int8 * max_seq_length
+- op_labels: int8 * max_seq_length
+- insert_labels: int8 * max_seq_length
+- template_input_ids: int16 * max_seq_length
+- template_attention_mask: int8 * max_seq_length
+- infill_labels: int16 * max_seq_length
+
+.idx 文件：索引
+- max_seq_length: uint32
+- num_samples: uint64
+- offsets: uint64[]
+```
+
+### 使用方法
+
+**步骤 1：转换数据格式**
+```bash
+# 转换训练集
+python scripts/generate_tokenized_data.py \
+    --input_file ./static_training_data/train.jsonl \
+    --output_prefix ./tokenized_data/train \
+    --tokenizer hfl/chinese-macbert-base \
+    --max_seq_length 128 \
+    --num_workers 20 \
+    --chunk_size 50000
+
+# 转换验证集
+python scripts/generate_tokenized_data.py \
+    --input_file ./static_training_data/dev.jsonl \
+    --output_prefix ./tokenized_data/dev \
+    --tokenizer hfl/chinese-macbert-base \
+    --max_seq_length 128
+```
+
+**步骤 2：训练时使用预计算数据**
+```bash
+python scripts/train.py \
+    --tokenized_data \
+    --train_data_prefix ./tokenized_data/train \
+    --dev_data_prefix ./tokenized_data/dev \
+    --pretrained_model hfl/chinese-macbert-base \
+    --batch_size 64 \
+    --num_workers 8 \
+    --prefetch_factor 4
+```
+
+### 预期效果
+- 训练时 CPU 开销降低 90%+（只需读取 mmap + numpy 类型转换）
+- GPU 利用率大幅提升（功率应接近满载 400W）
+- 数据文件变大约 2-3 倍（二进制 vs JSON），但内存占用更低
+
+### 注意事项
+1. 二进制格式不存储原文（`source_text`/`target_text` 为 `None`），如需调试请使用原 JSONL
+2. 修改 `max_seq_length` 需要重新生成数据
+3. 推荐设置 `persistent_workers=True` 避免重复初始化 mmap
 
 ---
 

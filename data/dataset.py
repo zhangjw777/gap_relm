@@ -1223,3 +1223,197 @@ def load_clean_sentences(
                     break
     
     return sentences
+
+class TokenizedBinaryDataset(Dataset):
+    """
+    预计算 tokenize 的二进制数据集（最高效的数据加载方式）
+    
+    特点：
+    - 数据在生成阶段就已完成 tokenize，训练时零 CPU 计算
+    - 使用内存映射 (mmap) 直接访问二进制文件，避免文件 I/O 开销
+    - 每个样本固定大小，支持 O(1) 随机访问
+    - 适合千万级数据集训练
+    
+    文件格式：
+    - .bin: 连续存储的二进制 tensor 数据
+    - .idx: 头部信息 + 样本偏移数组
+    
+    使用方法：
+    1. 先用 generate_tokenized_data.py 将 JSONL 转换为二进制格式
+    2. 训练时使用此数据集类加载
+    """
+    
+    def __init__(
+        self,
+        data_prefix: str,
+        enable_aux_mlm: bool = True,
+        aux_mlm_prob: float = 0.15,
+    ):
+        """
+        Args:
+            data_prefix: 数据文件前缀（不含 .bin/.idx 后缀）
+            enable_aux_mlm: 是否启用辅助 MLM（训练时随机 mask）
+            aux_mlm_prob: 辅助 MLM 的 mask 比例
+        """
+        self.data_prefix = data_prefix
+        self.enable_aux_mlm = enable_aux_mlm
+        self.aux_mlm_prob = aux_mlm_prob
+        
+        # 读取索引文件
+        idx_file = f"{data_prefix}.idx"
+        if not os.path.exists(idx_file):
+            raise FileNotFoundError(f"Index file not found: {idx_file}")
+        
+        with open(idx_file, 'rb') as f:
+            # 读取头部
+            self.max_seq_length = struct.unpack('<I', f.read(4))[0]
+            self.num_samples = struct.unpack('<Q', f.read(8))[0]
+            
+            # 读取偏移数组
+            self.offsets = []
+            for _ in range(self.num_samples):
+                offset = struct.unpack('<Q', f.read(8))[0]
+                self.offsets.append(offset)
+        
+        # 计算每个样本的字节大小
+        # input_ids(int16) + attention_mask(int8) + op_labels(int8) + insert_labels(int8)
+        # + template_input_ids(int16) + template_attention_mask(int8) + infill_labels(int16)
+        self.sample_size = self.max_seq_length * 10
+        
+        # 内存映射二进制文件
+        bin_file = f"{data_prefix}.bin"
+        if not os.path.exists(bin_file):
+            raise FileNotFoundError(f"Binary file not found: {bin_file}")
+        
+        self._mmap = None
+        self._bin_file = None
+        self._open_mmap(bin_file)
+        
+        print(f"TokenizedBinaryDataset initialized:")
+        print(f"  Samples: {self.num_samples:,}")
+        print(f"  Max sequence length: {self.max_seq_length}")
+        print(f"  Sample size: {self.sample_size} bytes")
+        print(f"  Binary file: {bin_file}")
+    
+    def _open_mmap(self, bin_file: str):
+        """打开内存映射文件"""
+        self._bin_file = open(bin_file, 'rb')
+        self._mmap = mmap.mmap(
+            self._bin_file.fileno(),
+            0,  # 整个文件
+            access=mmap.ACCESS_READ
+        )
+    
+    def __len__(self) -> int:
+        return self.num_samples
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """获取单个样本（直接从内存映射读取，几乎零开销）"""
+        if self._mmap is None:
+            raise RuntimeError("Memory map not initialized")
+        
+        offset = self.offsets[idx]
+        seq_len = self.max_seq_length
+        
+        # 从内存映射读取二进制数据
+        data = self._mmap[offset:offset + self.sample_size]
+        
+        # 解析各个字段
+        ptr = 0
+        
+        # input_ids: int16
+        input_ids = np.frombuffer(data[ptr:ptr + seq_len * 2], dtype=np.int16).copy()
+        ptr += seq_len * 2
+        
+        # attention_mask: int8
+        attention_mask = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        ptr += seq_len
+        
+        # op_labels: int8
+        op_labels = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        ptr += seq_len
+        
+        # insert_labels: int8
+        insert_labels = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        ptr += seq_len
+        
+        # template_input_ids: int16
+        template_input_ids = np.frombuffer(data[ptr:ptr + seq_len * 2], dtype=np.int16).copy()
+        ptr += seq_len * 2
+        
+        # template_attention_mask: int8
+        template_attention_mask = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        ptr += seq_len
+        
+        # infill_labels: int16
+        infill_labels = np.frombuffer(data[ptr:ptr + seq_len * 2], dtype=np.int16).copy()
+        
+        # 转换为 PyTorch tensor
+        input_ids_tensor = torch.from_numpy(input_ids.astype(np.int64))
+        attention_mask_tensor = torch.from_numpy(attention_mask.astype(np.int64))
+        op_labels_tensor = torch.from_numpy(op_labels.astype(np.int64))
+        insert_labels_tensor = torch.from_numpy(insert_labels.astype(np.int64))
+        template_input_ids_tensor = torch.from_numpy(template_input_ids.astype(np.int64))
+        template_attention_mask_tensor = torch.from_numpy(template_attention_mask.astype(np.int64))
+        infill_labels_tensor = torch.from_numpy(infill_labels.astype(np.int64))
+        
+        # 辅助 MLM（可选，训练时随机 mask KEEP 位置）
+        aux_mlm_labels = None
+        if self.enable_aux_mlm:
+            aux_mlm_labels = self._create_aux_mlm_labels(input_ids_tensor, op_labels_tensor)
+        
+        return {
+            'input_ids': input_ids_tensor,
+            'attention_mask': attention_mask_tensor,
+            'op_labels': op_labels_tensor,
+            'insert_labels': insert_labels_tensor,
+            'template_input_ids': template_input_ids_tensor,
+            'template_attention_mask': template_attention_mask_tensor,
+            'infill_labels': infill_labels_tensor,
+            'aux_mlm_labels': aux_mlm_labels,
+            'sample_id': f"tokenized_{idx}",
+            'source_text': None,  # 二进制格式不存储原文
+            'target_text': None,
+        }
+    
+    def _create_aux_mlm_labels(
+        self,
+        input_ids: torch.Tensor,
+        op_labels: torch.Tensor
+    ) -> torch.Tensor:
+        """创建辅助 MLM 标签（训练时随机 mask）"""
+        labels = torch.full_like(input_ids, -100)
+        
+        # 找出 KEEP 位置（op_labels == 0，且不是 padding）
+        # op_labels 中 -100 是 padding/special token
+        keep_mask = (op_labels == 0)
+        keep_positions = torch.where(keep_mask)[0].tolist()
+        
+        # 随机选择要 mask 的位置
+        num_to_mask = int(len(keep_positions) * self.aux_mlm_prob)
+        if num_to_mask > 0 and keep_positions:
+            positions_to_mask = random.sample(keep_positions, min(num_to_mask, len(keep_positions)))
+            for pos in positions_to_mask:
+                labels[pos] = input_ids[pos].clone()
+        
+        return labels
+    
+    def __del__(self):
+        """清理资源"""
+        if self._mmap is not None:
+            self._mmap.close()
+        if self._bin_file is not None:
+            self._bin_file.close()
+    
+    def __getstate__(self):
+        """pickle 序列化时不保存 mmap"""
+        state = self.__dict__.copy()
+        state['_mmap'] = None
+        state['_bin_file'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """pickle 反序列化时重新打开 mmap"""
+        self.__dict__.update(state)
+        bin_file = f"{self.data_prefix}.bin"
+        self._open_mmap(bin_file)

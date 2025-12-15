@@ -5,6 +5,7 @@
 1. 静态模式：使用预生成的训练数据（全部加载到内存）
 2. 惰性加载模式：预生成数据的内存友好版本（按需读取）
 3. 在线动态增强模式：从干净句子实时生成错误
+4. 预计算 tokenize 模式：最高效，训练时零 CPU 计算（推荐大规模数据）
 """
 
 import os
@@ -12,7 +13,14 @@ from typing import Optional, Tuple, List, Dict, Any
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
-from .dataset import GapReLMDataset, GapReLMCollator, OnlineAugmentedDataset, load_clean_sentences, LazyGapReLMDataset
+from .dataset import (
+    GapReLMDataset, 
+    GapReLMCollator, 
+    OnlineAugmentedDataset, 
+    load_clean_sentences, 
+    LazyGapReLMDataset,
+    TokenizedBinaryDataset,
+)
 
 
 def create_data_loaders(
@@ -573,3 +581,166 @@ def create_inference_loader(
         collate_fn=collate_fn,
         pin_memory=True
     )
+
+def create_tokenized_data_loaders(
+    train_prefix: str,
+    dev_prefix: Optional[str] = None,
+    test_prefix: Optional[str] = None,
+    tokenizer_name: str = "hfl/chinese-macbert-base",
+    batch_size: int = 32,
+    num_workers: int = 8,
+    prefetch_factor: int = 4,
+    enable_aux_mlm: bool = True,
+    aux_mlm_prob: float = 0.15,
+    distributed: bool = False,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], AutoTokenizer]:
+    """
+    创建预计算 tokenize 的数据加载器（最高效模式）
+    
+    此模式下数据已在生成阶段完成 tokenize，训练时直接读取二进制 tensor，
+    几乎无 CPU 计算开销，可充分利用 GPU。
+    
+    Args:
+        train_prefix: 训练数据文件前缀（不含 .bin/.idx 后缀）
+        dev_prefix: 验证数据文件前缀
+        test_prefix: 测试数据文件前缀
+        tokenizer_name: tokenizer 名称（用于返回，实际不会调用 tokenize）
+        batch_size: 批大小
+        num_workers: 数据加载工作进程数
+        prefetch_factor: 每个 worker 预取的 batch 数
+        enable_aux_mlm: 是否启用辅助 MLM（训练时随机 mask）
+        aux_mlm_prob: 辅助 MLM mask 比例
+        distributed: 是否分布式训练
+        world_size: 分布式世界大小
+        rank: 当前进程排名
+        
+    Returns:
+        (train_loader, dev_loader, test_loader, tokenizer)
+    """
+    # 加载 tokenizer（主要用于后续推理，训练时不会调用）
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    
+    # 创建 collator（简化版，因为数据已经是 tensor）
+    collator = GapReLMCollator(tokenizer, include_aux_mlm=enable_aux_mlm)
+    
+    # 训练数据集
+    print(f"Loading tokenized training data from {train_prefix}.*")
+    train_dataset = TokenizedBinaryDataset(
+        data_prefix=train_prefix,
+        enable_aux_mlm=enable_aux_mlm,
+        aux_mlm_prob=aux_mlm_prob,
+    )
+    
+    # 训练数据加载器
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            collate_fn=collator,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=num_workers > 0,  # 保持 worker 存活，避免重复初始化 mmap
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            collate_fn=collator,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=num_workers > 0,
+        )
+    
+    # 验证数据加载器
+    dev_loader = None
+    if dev_prefix and os.path.exists(f"{dev_prefix}.bin"):
+        print(f"Loading tokenized dev data from {dev_prefix}.*")
+        dev_dataset = TokenizedBinaryDataset(
+            data_prefix=dev_prefix,
+            enable_aux_mlm=enable_aux_mlm,
+            aux_mlm_prob=aux_mlm_prob,
+        )
+        
+        if distributed:
+            dev_sampler = DistributedSampler(
+                dev_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False
+            )
+            dev_loader = DataLoader(
+                dev_dataset,
+                batch_size=batch_size,
+                sampler=dev_sampler,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                collate_fn=collator,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+            )
+        else:
+            dev_loader = DataLoader(
+                dev_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                collate_fn=collator,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+            )
+    
+    # 测试数据加载器
+    test_loader = None
+    if test_prefix and os.path.exists(f"{test_prefix}.bin"):
+        print(f"Loading tokenized test data from {test_prefix}.*")
+        test_dataset = TokenizedBinaryDataset(
+            data_prefix=test_prefix,
+            enable_aux_mlm=enable_aux_mlm,
+            aux_mlm_prob=aux_mlm_prob,
+        )
+        
+        if distributed:
+            test_sampler = DistributedSampler(
+                test_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                sampler=test_sampler,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                collate_fn=collator,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+            )
+        else:
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                collate_fn=collator,
+                pin_memory=True,
+                persistent_workers=num_workers > 0,
+            )
+    
+    return train_loader, dev_loader, test_loader, tokenizer

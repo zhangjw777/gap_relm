@@ -38,7 +38,7 @@ NUM_WORKERS=16                              # 数据加载进程数（建议 4-1
 PREFETCH_FACTOR=4                          # 每个worker预取的batch数（默认2，可增大到4-8）
 CACHE_DIR="./cache"                        # 缓存目录
 USE_CACHE=true                             # 是否使用缓存
-LAZY_LOAD=false                            # 惰性加载模式（推荐大数据集>100万样本使用，节省内存）
+LAZY_LOAD=true                            # 惰性加载模式（推荐大数据集>100万样本使用，节省内存）
 
 # ========== 在线动态数据增强 ==========
 # 注意：使用预生成静态数据时，设置 ONLINE_AUGMENT=false
