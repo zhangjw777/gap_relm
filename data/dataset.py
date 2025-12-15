@@ -2,9 +2,10 @@
 PyTorch Dataset 和 Collator
 将处理后的样本转换为模型输入格式
 
-支持两种模式：
-1. 静态模式 (GapReLMDataset): 加载预处理好的训练数据
-2. 在线动态模式 (OnlineAugmentedDataset): 在 __getitem__ 中实时生成错误
+支持三种模式：
+1. 静态模式 (GapReLMDataset): 加载预处理好的训练数据（全部加载到内存，适合小数据集）
+2. 惰性加载模式 (LazyGapReLMDataset): 按需读取数据（适合大规模数据集，节省内存）
+3. 在线动态模式 (OnlineAugmentedDataset): 在 __getitem__ 中实时生成错误
 """
 
 import torch
@@ -16,6 +17,8 @@ import os
 import pickle
 import random
 import math
+import mmap
+import struct
 from tqdm import tqdm
 
 from .label_generator import ProcessedSample, create_sample_processor
@@ -492,6 +495,262 @@ class GapReLMDataset(Dataset):
                 labels[pos] = input_ids[pos].clone()
         
         return labels
+
+
+class LazyGapReLMDataset(Dataset):
+    """惰性加载 Gap-ReLM 数据集（内存友好版本）
+    
+    与 GapReLMDataset 不同，此类不会将所有数据加载到内存中。
+    它预先扫描文件建立索引（记录每行的字节偏移），
+    在 __getitem__ 时按需读取单行数据。
+    
+    适用场景：
+    - 大规模训练数据（百万级以上样本）
+    - 内存受限的环境
+    - 预计算标签格式的 JSONL 文件
+    """
+    
+    def __init__(
+        self,
+        data_file: str,
+        tokenizer,
+        max_seq_length: int = 128,
+        max_insert_num: int = 3,
+        enable_insert: bool = True,
+        enable_delete: bool = True,
+        normalize_text: bool = True,
+        enable_aux_mlm: bool = True,
+        aux_mlm_prob: float = 0.15,
+        index_cache_dir: Optional[str] = None,
+        use_index_cache: bool = True,
+    ):
+        """
+        Args:
+            data_file: JSONL 格式数据文件路径（预计算标签格式）
+            tokenizer: HuggingFace tokenizer
+            max_seq_length: 最大序列长度
+            max_insert_num: 最大插入数量
+            enable_insert: 是否启用插入
+            enable_delete: 是否启用删除
+            normalize_text: 是否规范化文本
+            enable_aux_mlm: 是否启用辅助MLM
+            aux_mlm_prob: 辅助MLM的mask比例
+            index_cache_dir: 索引缓存目录
+            use_index_cache: 是否使用/保存索引缓存
+        """
+        self.data_file = data_file
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+        self.max_insert_num = max_insert_num
+        self.enable_insert = enable_insert
+        self.enable_delete = enable_delete
+        self.enable_aux_mlm = enable_aux_mlm
+        self.aux_mlm_prob = aux_mlm_prob
+        
+        # 预处理器
+        self.preprocessor = TextPreprocessor() if normalize_text else None
+        
+        # 构建或加载行偏移索引
+        self.line_offsets: List[int] = []
+        self._build_index(index_cache_dir, use_index_cache)
+        
+        # 打开文件句柄（用于后续读取）
+        self._file_handle = None
+        
+        print(f"LazyGapReLMDataset initialized with {len(self.line_offsets)} samples (memory-efficient mode)")
+    
+    def _build_index(self, index_cache_dir: Optional[str], use_index_cache: bool):
+        """构建行偏移索引"""
+        index_file = None
+        if use_index_cache and index_cache_dir:
+            os.makedirs(index_cache_dir, exist_ok=True)
+            basename = os.path.basename(self.data_file)
+            index_file = os.path.join(index_cache_dir, f"{basename}.lazy_index.pkl")
+            
+            # 尝试加载缓存
+            if os.path.exists(index_file):
+                # 检查索引是否比数据文件新
+                if os.path.getmtime(index_file) > os.path.getmtime(self.data_file):
+                    print(f"Loading line index from cache: {index_file}")
+                    with open(index_file, 'rb') as f:
+                        self.line_offsets = pickle.load(f)
+                    return
+        
+        # 扫描文件构建索引
+        print(f"Building line index for {self.data_file}...")
+        self.line_offsets = []
+        
+        with open(self.data_file, 'rb') as f:
+            offset = 0
+            for line in tqdm(f, desc="Indexing"):
+                line_str = line.decode('utf-8').strip()
+                if line_str:
+                    # 验证是否为有效 JSON 且为预计算格式
+                    try:
+                        data = json.loads(line_str)
+                        source = data.get('source', data.get('src', ''))
+                        # 检查是否为预计算格式
+                        if 'op_labels' in data and 'insert_labels' in data and source:
+                            # 检查长度限制
+                            if len(source) <= self.max_seq_length - 2:
+                                self.line_offsets.append(offset)
+                    except json.JSONDecodeError:
+                        pass
+                offset += len(line)
+        
+        print(f"Indexed {len(self.line_offsets)} valid samples")
+        
+        # 保存索引缓存
+        if use_index_cache and index_file:
+            with open(index_file, 'wb') as f:
+                pickle.dump(self.line_offsets, f)
+            print(f"Index cache saved to: {index_file}")
+    
+    def _get_file_handle(self):
+        """获取文件句柄（懒加载）"""
+        if self._file_handle is None:
+            self._file_handle = open(self.data_file, 'r', encoding='utf-8')
+        return self._file_handle
+    
+    def _read_line_at_offset(self, offset: int) -> str:
+        """读取指定偏移位置的行"""
+        f = self._get_file_handle()
+        f.seek(offset)
+        return f.readline().strip()
+    
+    def __len__(self) -> int:
+        return len(self.line_offsets)
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """按需读取单个样本"""
+        offset = self.line_offsets[idx]
+        line = self._read_line_at_offset(offset)
+        
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            # 如果解析失败，返回空样本（会在后续被过滤）
+            raise ValueError(f"Failed to parse JSON at index {idx}")
+        
+        return self._convert_precomputed_to_features(data, idx)
+    
+    def _convert_precomputed_to_features(self, data: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        """将预计算数据转换为模型输入特征"""
+        source = data['source']
+        target = data['target']
+        op_labels = data['op_labels']
+        insert_labels = data['insert_labels']
+        
+        # 预处理
+        if self.preprocessor:
+            source = self.preprocessor.preprocess(source)
+            target = self.preprocessor.preprocess(target)
+        
+        # 编码源序列
+        source_encoding = self.tokenizer(
+            source,
+            add_special_tokens=True,
+            max_length=self.max_seq_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        # 处理 Planner 标签
+        # [CLS] + tokens + [SEP] + padding
+        op_labels_padded = [-100] + op_labels[:self.max_seq_length-2] + [-100]
+        insert_labels_padded = [0] + insert_labels[:self.max_seq_length-2] + [0]
+        
+        # Padding
+        op_labels_padded = op_labels_padded + [-100] * (self.max_seq_length - len(op_labels_padded))
+        insert_labels_padded = insert_labels_padded + [0] * (self.max_seq_length - len(insert_labels_padded))
+        
+        # 构建模板输入
+        template_tokens = data.get('template_tokens', list(source))
+        template_str = ''.join(template_tokens).replace('[MASK]', self.tokenizer.mask_token)
+        
+        template_encoding = self.tokenizer(
+            template_str,
+            add_special_tokens=True,
+            max_length=self.max_seq_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        # 构建 Infiller 标签
+        mask_token_id = self.tokenizer.mask_token_id
+        infill_labels = [-100] * self.max_seq_length
+        
+        template_input_ids = template_encoding['input_ids'].squeeze(0)
+        mask_positions_in_ids = (template_input_ids == mask_token_id).nonzero(as_tuple=True)[0]
+        
+        gold_tokens = data.get('gold_tokens', [])
+        for i, pos in enumerate(mask_positions_in_ids):
+            if i < len(gold_tokens):
+                token_id = self.tokenizer.convert_tokens_to_ids(gold_tokens[i])
+                infill_labels[pos.item()] = token_id
+        
+        # 辅助 MLM (可选)
+        aux_mlm_labels = None
+        if self.enable_aux_mlm:
+            aux_mlm_labels = self._create_aux_mlm_labels(
+                source_encoding['input_ids'].squeeze(0),
+                op_labels
+            )
+        
+        return {
+            'input_ids': source_encoding['input_ids'].squeeze(0),
+            'attention_mask': source_encoding['attention_mask'].squeeze(0),
+            'op_labels': torch.tensor(op_labels_padded, dtype=torch.long),
+            'insert_labels': torch.tensor(insert_labels_padded, dtype=torch.long),
+            'template_input_ids': template_encoding['input_ids'].squeeze(0),
+            'template_attention_mask': template_encoding['attention_mask'].squeeze(0),
+            'infill_labels': torch.tensor(infill_labels, dtype=torch.long),
+            'aux_mlm_labels': aux_mlm_labels,
+            'sample_id': f"lazy_{idx}",
+            'source_text': source,
+            'target_text': target,
+        }
+    
+    def _create_aux_mlm_labels(
+        self,
+        input_ids: torch.Tensor,
+        op_labels: List[int]
+    ) -> torch.Tensor:
+        """创建辅助 MLM 标签"""
+        labels = torch.full_like(input_ids, -100)
+        
+        keep_positions = []
+        for i, op in enumerate(op_labels):
+            if op == 0:  # KEEP
+                pos = i + 1
+                if pos < len(input_ids) - 1:
+                    keep_positions.append(pos)
+        
+        num_to_mask = int(len(keep_positions) * self.aux_mlm_prob)
+        if num_to_mask > 0 and keep_positions:
+            positions_to_mask = random.sample(keep_positions, min(num_to_mask, len(keep_positions)))
+            for pos in positions_to_mask:
+                labels[pos] = input_ids[pos].clone()
+        
+        return labels
+    
+    def __del__(self):
+        """清理文件句柄"""
+        if self._file_handle is not None:
+            self._file_handle.close()
+    
+    def __getstate__(self):
+        """pickle 序列化时不保存文件句柄"""
+        state = self.__dict__.copy()
+        state['_file_handle'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """pickle 反序列化时重置文件句柄"""
+        self.__dict__.update(state)
+        self._file_handle = None
 
 
 class GapReLMCollator:

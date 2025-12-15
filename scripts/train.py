@@ -160,6 +160,10 @@ def parse_args():
     parser.add_argument("--no_cache", action="store_true",
                         help="Disable data caching")
     
+    # ========== 惰性加载参数（大规模数据集内存优化） ==========
+    parser.add_argument("--lazy_load", action="store_true",
+                        help="Enable lazy loading for large precomputed datasets (memory-efficient, recommended for >1M samples)")
+    
     # ========== 在线动态数据增强参数 ==========
     parser.add_argument("--online_augment", action="store_true", default=True,
                         help="Enable online dynamic data augmentation (default: True)")
@@ -410,7 +414,10 @@ def main():
     else:
         # 静态数据模式（使用预生成的训练数据）
         if is_main_process:
-            logger.info("Using STATIC pre-generated training data")
+            if args.lazy_load:
+                logger.info("Using STATIC pre-generated training data with LAZY LOADING (memory-efficient)")
+            else:
+                logger.info("Using STATIC pre-generated training data")
         
         train_loader, dev_loader, _, tokenizer = create_data_loaders(
             train_file=args.train_file,
@@ -431,6 +438,7 @@ def main():
             distributed=is_distributed,
             world_size=world_size if is_distributed else 1,
             rank=rank if is_distributed else 0,
+            lazy_load=args.lazy_load,
         )
     
     if is_main_process:

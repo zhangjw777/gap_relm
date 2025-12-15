@@ -1,9 +1,10 @@
 """
 数据加载器工厂函数
 
-支持两种数据模式：
-1. 静态模式：使用预生成的训练数据
-2. 在线动态增强模式：从干净句子实时生成错误
+支持三种数据模式：
+1. 静态模式：使用预生成的训练数据（全部加载到内存）
+2. 惰性加载模式：预生成数据的内存友好版本（按需读取）
+3. 在线动态增强模式：从干净句子实时生成错误
 """
 
 import os
@@ -11,7 +12,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
-from .dataset import GapReLMDataset, GapReLMCollator, OnlineAugmentedDataset, load_clean_sentences
+from .dataset import GapReLMDataset, GapReLMCollator, OnlineAugmentedDataset, load_clean_sentences, LazyGapReLMDataset
 
 
 def create_data_loaders(
@@ -36,6 +37,7 @@ def create_data_loaders(
     distributed: bool = False,
     world_size: int = 1,
     rank: int = 0,
+    lazy_load: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], AutoTokenizer]:
     """
     创建训练、验证、测试数据加载器
@@ -62,6 +64,7 @@ def create_data_loaders(
         distributed: 是否分布式训练
         world_size: 分布式世界大小
         rank: 当前进程排名
+        lazy_load: 是否使用惰性加载模式（推荐大数据集使用，节省内存）
         
     Returns:
         (train_loader, dev_loader, test_loader, tokenizer)
@@ -72,24 +75,40 @@ def create_data_loaders(
     # 创建 collator
     collator = GapReLMCollator(tokenizer, include_aux_mlm=enable_aux_mlm)
     
-    # 创建数据集的通用参数
-    dataset_kwargs = {
-        'tokenizer': tokenizer,
-        'max_seq_length': max_seq_length,
-        'max_insert_num': max_insert_num,
-        'enable_insert': enable_insert,
-        'enable_delete': enable_delete,
-        'alignment_algorithm': alignment_algorithm,
-        'data_format': data_format,
-        'cache_dir': cache_dir,
-        'use_cache': use_cache,
-        'normalize_text': normalize_text,
-        'enable_aux_mlm': enable_aux_mlm,
-        'aux_mlm_prob': aux_mlm_prob,
-    }
-    
-    # 训练数据加载器
-    train_dataset = GapReLMDataset(data_file=train_file, **dataset_kwargs)
+    # 选择数据集类
+    if lazy_load:
+        # 惰性加载模式：适用于大规模预计算数据集
+        print("Using lazy loading mode (memory-efficient)")
+        lazy_dataset_kwargs = {
+            'tokenizer': tokenizer,
+            'max_seq_length': max_seq_length,
+            'max_insert_num': max_insert_num,
+            'enable_insert': enable_insert,
+            'enable_delete': enable_delete,
+            'normalize_text': normalize_text,
+            'enable_aux_mlm': enable_aux_mlm,
+            'aux_mlm_prob': aux_mlm_prob,
+            'index_cache_dir': cache_dir,
+            'use_index_cache': use_cache,
+        }
+        train_dataset = LazyGapReLMDataset(data_file=train_file, **lazy_dataset_kwargs)
+    else:
+        # 标准模式：全部加载到内存
+        dataset_kwargs = {
+            'tokenizer': tokenizer,
+            'max_seq_length': max_seq_length,
+            'max_insert_num': max_insert_num,
+            'enable_insert': enable_insert,
+            'enable_delete': enable_delete,
+            'alignment_algorithm': alignment_algorithm,
+            'data_format': data_format,
+            'cache_dir': cache_dir,
+            'use_cache': use_cache,
+            'normalize_text': normalize_text,
+            'enable_aux_mlm': enable_aux_mlm,
+            'aux_mlm_prob': aux_mlm_prob,
+        }
+        train_dataset = GapReLMDataset(data_file=train_file, **dataset_kwargs)
     
     if distributed:
         train_sampler = DistributedSampler(
@@ -120,10 +139,26 @@ def create_data_loaders(
             drop_last=True
         )
     
+    # 验证数据集的通用参数（验证集通常较小，不需要惰性加载）
+    dev_dataset_kwargs = {
+        'tokenizer': tokenizer,
+        'max_seq_length': max_seq_length,
+        'max_insert_num': max_insert_num,
+        'enable_insert': enable_insert,
+        'enable_delete': enable_delete,
+        'alignment_algorithm': alignment_algorithm,
+        'data_format': data_format,
+        'cache_dir': cache_dir,
+        'use_cache': use_cache,
+        'normalize_text': normalize_text,
+        'enable_aux_mlm': enable_aux_mlm,
+        'aux_mlm_prob': aux_mlm_prob,
+    }
+    
     # 验证数据加载器
     dev_loader = None
     if dev_file and os.path.exists(dev_file):
-        dev_dataset = GapReLMDataset(data_file=dev_file, **dataset_kwargs)
+        dev_dataset = GapReLMDataset(data_file=dev_file, **dev_dataset_kwargs)
         
         if distributed:
             dev_sampler = DistributedSampler(
@@ -155,7 +190,7 @@ def create_data_loaders(
     # 测试数据加载器
     test_loader = None
     if test_file and os.path.exists(test_file):
-        test_dataset = GapReLMDataset(data_file=test_file, **dataset_kwargs)
+        test_dataset = GapReLMDataset(data_file=test_file, **dev_dataset_kwargs)
         
         if distributed:
             test_sampler = DistributedSampler(

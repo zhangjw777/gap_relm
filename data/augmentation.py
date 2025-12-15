@@ -520,12 +520,18 @@ class StaticDataGenerator:
     
     def _stats(self, samples):
         total = len(samples)
-        positive = sum(1 for s in samples if not s.get('gold_tokens'))
+        # 修复：使用 source == target 判断正例，而不是 gold_tokens 为空
+        # 因为 MULTIPLY 类型的负例 gold_tokens 也为空（删除操作不需要预测字符）
+        positive = sum(1 for s in samples if s.get('source') == s.get('target'))
         negative = total - positive
         
         # 统计错误类型（通过label推断）
         type_counts = {'S': 0, 'M': 0, 'R': 0}
         for s in samples:
+            # 跳过正例
+            if s.get('source') == s.get('target'):
+                continue
+                
             op_labels = s.get('op_labels', [])
             insert_labels = s.get('insert_labels', [])
             

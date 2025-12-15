@@ -16,6 +16,7 @@ from .dataset import (
     OnlineAugmentedDataset,
     LengthAdaptiveLambda,
     load_clean_sentences,
+    LazyGapReLMDataset,  # 内存友好的惰性加载数据集
 )
 from .data_loader import create_data_loaders, create_online_data_loaders
 

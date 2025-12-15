@@ -3,8 +3,8 @@
 # 用于Planner + Infiller联合多任务训练
 
 # ========== 必填参数 ==========
-TRAIN_FILE="data/clean_sentences.txt"                              # 必须：训练数据文件路径
-DEV_FILE=""                                # 可选：验证数据文件路径（推荐提供）
+TRAIN_FILE="./static_training_data/train.jsonl"  # 预生成的静态训练数据（带预计算标签）
+DEV_FILE="./static_training_data/dev.jsonl"      # 预生成的静态验证数据
 
 # ========== 基础配置 ==========
 OUTPUT_DIR="./outputs"                     # 输出目录
@@ -38,11 +38,13 @@ NUM_WORKERS=16                              # 数据加载进程数（建议 4-1
 PREFETCH_FACTOR=4                          # 每个worker预取的batch数（默认2，可增大到4-8）
 CACHE_DIR="./cache"                        # 缓存目录
 USE_CACHE=true                             # 是否使用缓存
+LAZY_LOAD=false                            # 惰性加载模式（推荐大数据集>100万样本使用，节省内存）
 
 # ========== 在线动态数据增强 ==========
-ONLINE_AUGMENT=true                        # 启用在线动态数据增强（默认开启）
-CLEAN_TRAIN_FILE="data/clean_sentences.txt"                        # 干净训练句子文件（留空则使用TRAIN_FILE）
-FROZEN_DEV_FILE="data/frozen_dev.jsonl"                         # 固定验证集文件（推荐使用）
+# 注意：使用预生成静态数据时，设置 ONLINE_AUGMENT=false
+ONLINE_AUGMENT=false                       # 关闭在线动态数据增强（使用预生成静态数据）
+CLEAN_TRAIN_FILE=""                        # 干净训练句子文件（留空：使用预生成数据）
+FROZEN_DEV_FILE=""                         # 固定验证集文件（留空：使用DEV_FILE）
 CLEAN_FILE_FORMAT="txt"                    # 干净文件格式（txt/json/jsonl）
 P_CORRUPT=0.7                              # 造错概率
 BASE_LAMBDA=1.5                            # 基础泊松参数
@@ -193,6 +195,10 @@ while [[ $# -gt 0 ]]; do
             MAX_LAMBDA="$2"
             shift 2
             ;;
+        --lazy_load)
+            LAZY_LOAD=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             echo "Available options:"
@@ -225,6 +231,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --no_length_adaptive         关闭长度自适应λ"
             echo "  --min_lambda <float>         最小λ值"
             echo "  --max_lambda <float>         最大λ值"
+            echo ""
+            echo "大数据集内存优化选项:"
+            echo "  --lazy_load                  启用惰性加载（推荐>100万样本数据集使用）"
             exit 1
             ;;
     esac
@@ -421,6 +430,11 @@ if [ "$ONLINE_AUGMENT" = true ]; then
     fi
 else
     CMD="$CMD --no_online_augment"
+    
+    # 惰性加载（仅在静态数据模式下生效）
+    if [ "$LAZY_LOAD" = true ]; then
+        CMD="$CMD --lazy_load"
+    fi
 fi
 
 # ========== 运行训练 ==========

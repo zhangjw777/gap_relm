@@ -551,6 +551,60 @@ __getitem__(idx) 被调用时:
 
 ---
 
+## 〇-1、内存溢出问题修复 - 惰性加载数据集（2025-12-15 新增 ✅）
+
+### 问题描述
+在使用预计算格式的大规模数据集（700万条样本）训练时，系统 RAM 溢出导致进程被杀死（exitcode: -9）。
+
+**根本原因**：
+- `GapReLMDataset` 在 `__init__` 时调用 `_load_and_process`，一次性将所有数据加载到 `self.samples` 列表
+- 700万条 `ProcessedSample` 对象，每条约 1-2KB 内存
+- 粗略估计：700万 × 1.5KB ≈ 10GB+，加上 Python 对象开销、pickle 加载临时内存、DDP 多进程等，轻松超过 32GB RAM
+
+### 解决方案：惰性加载数据集 `LazyGapReLMDataset`
+
+新增 `LazyGapReLMDataset` 类，采用**按需读取**策略：
+
+1. **索引扫描**：初始化时只扫描文件，记录每行的字节偏移（约 700万 × 8B = 56MB）
+2. **按需读取**：`__getitem__` 时通过 `file.seek(offset)` 定位并读取单行
+3. **索引缓存**：首次扫描后保存索引文件，后续启动秒加载
+
+**内存占用对比**：
+| 模式 | 内存占用 | 适用场景 |
+|------|---------|---------|
+| `GapReLMDataset` | ~10GB+ | 小数据集（<100万样本） |
+| `LazyGapReLMDataset` | ~100MB | 大数据集（>100万样本） |
+
+### 代码修改
+
+| 文件 | 修改内容 |
+|------|---------|
+| `data/dataset.py` | 新增 `LazyGapReLMDataset` 类 |
+| `data/data_loader.py` | `create_data_loaders` 添加 `lazy_load` 参数 |
+| `data/__init__.py` | 导出 `LazyGapReLMDataset` |
+| `scripts/train.py` | 添加 `--lazy_load` 命令行参数 |
+
+### 使用方法
+
+```bash
+# 使用惰性加载（推荐用于大数据集）
+torchrun --nproc_per_node=2 scripts/train.py \
+    --train_file data/train_7m.jsonl \
+    --dev_file data/dev.jsonl \
+    --no_online_augment \
+    --lazy_load \
+    --batch_size 64 \
+    --num_epochs 10
+```
+
+### 注意事项
+1. `--lazy_load` 仅适用于**预计算标签格式**的 JSONL 文件
+2. 首次运行会扫描文件建立索引，后续启动直接加载索引缓存
+3. 验证集通常较小，不使用惰性加载（直接全部加载）
+4. 索引缓存默认保存在 `--cache_dir` 目录下
+
+---
+
 ## 四、修改总结
 
 ### 已完成任务
@@ -570,7 +624,8 @@ __getitem__(idx) 被调用时:
 14. ✅ 创建 `scripts/generate_frozen_dev.py`，Frozen-Dev-Synth 生成脚本
 15. ✅ 更新 `scripts/run_ddp.sh`，添加在线增强参数
 16. ✅ 更新 `scripts/quick_start.sh`，支持在线/静态两种模式
-17. ✅ 更新本文档
+17. ✅ **新增 `LazyGapReLMDataset` 惰性加载数据集，解决大规模数据内存溢出问题**
+18. ✅ 更新本文档
 
 ### 未完成任务
 - 需要在服务器上测试代码
@@ -592,3 +647,9 @@ __getitem__(idx) 被调用时:
 3. **计算开销**：每次 `__getitem__` 都会执行造错和对齐，CPU 开销较大
 4. **num_workers**：建议使用较大的 num_workers 以并行处理数据
 5. **分布式训练**：每个进程独立造错，同一句子在不同 GPU 上可能有不同错误
+
+### 惰性加载数据集
+1. **适用场景**：大规模预计算数据集（>100万样本），内存受限环境
+2. **首次启动**：需要扫描文件建立索引，耗时约几分钟（700万条约3-5分钟）
+3. **后续启动**：直接加载索引缓存，秒启动
+4. **数据格式**：仅支持预计算标签格式的 JSONL 文件
