@@ -5,6 +5,8 @@
 - 存储格式：二进制分片文件 (.bin) + 索引文件 (.idx)
 - 训练时直接读取 tensor，无需任何 CPU 计算
 - 显著减少 DataLoader 的 CPU 瓶颈，提升 GPU 利用率
+
+优化版本：流式处理 + 批量 tokenize，避免内存爆炸
 """
 
 import sys
@@ -17,8 +19,6 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 from dataclasses import dataclass
-from multiprocessing import Pool, cpu_count
-from functools import partial
 import random
 
 from transformers import AutoTokenizer
@@ -68,6 +68,11 @@ class TokenizedDataWriter:
         self.max_seq_length = max_seq_length
         self.sample_size = max_seq_length * 10  # 每样本字节数
         
+        # 确保输出目录存在
+        output_dir = os.path.dirname(output_prefix)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
         self.bin_file = open(f"{output_prefix}.bin", 'wb')
         self.offsets: List[int] = []
         self.current_offset = 0
@@ -112,208 +117,239 @@ class TokenizedDataWriter:
         print(f"Written {len(self.offsets)} samples to {self.output_prefix}.*")
 
 
-def tokenize_sample(
-    sample: Dict[str, Any],
+def tokenize_batch(
+    samples: List[Dict[str, Any]],
     tokenizer,
     max_seq_length: int,
-) -> Optional[TokenizedSample]:
+) -> List[Optional[TokenizedSample]]:
     """
-    将单个样本 tokenize 为二进制格式
+    批量 tokenize 样本（利用 tokenizer 的批处理能力加速）
     
     Args:
-        sample: 包含 source, target, op_labels, insert_labels, template_tokens, gold_tokens 的字典
+        samples: 样本字典列表
         tokenizer: HuggingFace tokenizer
         max_seq_length: 最大序列长度
     
     Returns:
-        TokenizedSample 或 None（如果样本无效）
+        TokenizedSample 列表（无效样本为 None）
     """
-    source = sample['source']
-    op_labels = sample['op_labels']
-    insert_labels = sample['insert_labels']
-    template_tokens = sample.get('template_tokens', list(source))
-    gold_tokens = sample.get('gold_tokens', [])
+    # 过滤有效样本并收集文本
+    valid_indices = []
+    sources = []
+    templates = []
+    sample_data = []
     
-    # 检查长度
-    if len(source) > max_seq_length - 2:
-        return None
-    
-    # 1. 编码源序列
-    source_encoding = tokenizer(
-        source,
-        add_special_tokens=True,
-        max_length=max_seq_length,
-        padding='max_length',
-        truncation=True,
-        return_tensors='np'
-    )
-    
-    input_ids = source_encoding['input_ids'].squeeze(0)
-    attention_mask = source_encoding['attention_mask'].squeeze(0)
-    
-    # 2. 处理 Planner 标签
-    # [CLS] + tokens + [SEP] + padding
-    op_labels_padded = [-100] + op_labels[:max_seq_length-2] + [-100]
-    insert_labels_padded = [0] + insert_labels[:max_seq_length-2] + [0]
-    
-    # Padding
-    op_labels_padded = op_labels_padded + [-100] * (max_seq_length - len(op_labels_padded))
-    insert_labels_padded = insert_labels_padded + [0] * (max_seq_length - len(insert_labels_padded))
-    
-    # 3. 构建模板输入
-    template_str = ''.join(template_tokens).replace('[MASK]', tokenizer.mask_token)
-    
-    template_encoding = tokenizer(
-        template_str,
-        add_special_tokens=True,
-        max_length=max_seq_length,
-        padding='max_length',
-        truncation=True,
-        return_tensors='np'
-    )
-    
-    template_input_ids = template_encoding['input_ids'].squeeze(0)
-    template_attention_mask = template_encoding['attention_mask'].squeeze(0)
-    
-    # 4. 构建 Infiller 标签
-    mask_token_id = tokenizer.mask_token_id
-    infill_labels = np.full(max_seq_length, -100, dtype=np.int16)
-    
-    mask_positions = np.where(template_input_ids == mask_token_id)[0]
-    
-    for i, pos in enumerate(mask_positions):
-        if i < len(gold_tokens):
-            token_id = tokenizer.convert_tokens_to_ids(gold_tokens[i])
-            infill_labels[pos] = token_id
-    
-    return TokenizedSample(
-        input_ids=input_ids.astype(np.int16),
-        attention_mask=attention_mask.astype(np.int8),
-        op_labels=np.array(op_labels_padded, dtype=np.int8),
-        insert_labels=np.array(insert_labels_padded, dtype=np.int8),
-        template_input_ids=template_input_ids.astype(np.int16),
-        template_attention_mask=template_attention_mask.astype(np.int8),
-        infill_labels=infill_labels,
-    )
-
-
-def process_chunk(
-    chunk_data: Tuple[int, List[str]],
-    tokenizer_name: str,
-    max_seq_length: int,
-) -> List[TokenizedSample]:
-    """
-    处理一个数据块（用于多进程）
-    
-    Args:
-        chunk_data: (chunk_id, lines)
-        tokenizer_name: tokenizer 名称
-        max_seq_length: 最大序列长度
-    
-    Returns:
-        TokenizedSample 列表
-    """
-    chunk_id, lines = chunk_data
-    
-    # 每个进程创建自己的 tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    results = []
-    for line in lines:
-        try:
-            sample = json.loads(line.strip())
-            tokenized = tokenize_sample(sample, tokenizer, max_seq_length)
-            if tokenized is not None:
-                results.append(tokenized)
-        except (json.JSONDecodeError, KeyError) as e:
+    for i, sample in enumerate(samples):
+        source = sample.get('source', '')
+        if not source or len(source) > max_seq_length - 2:
             continue
+        
+        template_tokens = sample.get('template_tokens', list(source))
+        template_str = ''.join(template_tokens).replace('[MASK]', tokenizer.mask_token)
+        
+        valid_indices.append(i)
+        sources.append(source)
+        templates.append(template_str)
+        sample_data.append(sample)
+    
+    if not sources:
+        return [None] * len(samples)
+    
+    # 批量 tokenize（这是最耗时的操作，批处理可以显著加速）
+    source_encodings = tokenizer(
+        sources,
+        add_special_tokens=True,
+        max_length=max_seq_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='np'
+    )
+    
+    template_encodings = tokenizer(
+        templates,
+        add_special_tokens=True,
+        max_length=max_seq_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='np'
+    )
+    
+    # 构建结果
+    results = [None] * len(samples)
+    mask_token_id = tokenizer.mask_token_id
+    
+    for j, orig_idx in enumerate(valid_indices):
+        sample = sample_data[j]
+        op_labels = sample['op_labels']
+        insert_labels = sample['insert_labels']
+        gold_tokens = sample.get('gold_tokens', [])
+        
+        # 处理 Planner 标签
+        op_labels_padded = [-100] + op_labels[:max_seq_length-2] + [-100]
+        insert_labels_padded = [0] + insert_labels[:max_seq_length-2] + [0]
+        
+        # Padding
+        op_labels_padded = op_labels_padded + [-100] * (max_seq_length - len(op_labels_padded))
+        insert_labels_padded = insert_labels_padded + [0] * (max_seq_length - len(insert_labels_padded))
+        
+        # 构建 Infiller 标签
+        template_input_ids = template_encodings['input_ids'][j]
+        infill_labels = np.full(max_seq_length, -100, dtype=np.int16)
+        
+        mask_positions = np.where(template_input_ids == mask_token_id)[0]
+        for k, pos in enumerate(mask_positions):
+            if k < len(gold_tokens):
+                token_id = tokenizer.convert_tokens_to_ids(gold_tokens[k])
+                infill_labels[pos] = token_id
+        
+        results[orig_idx] = TokenizedSample(
+            input_ids=source_encodings['input_ids'][j].astype(np.int16),
+            attention_mask=source_encodings['attention_mask'][j].astype(np.int8),
+            op_labels=np.array(op_labels_padded, dtype=np.int8),
+            insert_labels=np.array(insert_labels_padded, dtype=np.int8),
+            template_input_ids=template_input_ids.astype(np.int16),
+            template_attention_mask=template_encodings['attention_mask'][j].astype(np.int8),
+            infill_labels=infill_labels,
+        )
     
     return results
 
 
-def convert_jsonl_to_tokenized(
+def convert_jsonl_to_tokenized_streaming(
     input_file: str,
     output_prefix: str,
     tokenizer_name: str = "hfl/chinese-macbert-base",
     max_seq_length: int = 128,
-    num_workers: int = None,
-    chunk_size: int = 10000,
+    batch_size: int = 1000,
     shuffle: bool = True,
     seed: int = 42,
 ):
     """
-    将 JSONL 文件转换为预计算 tokenize 的二进制格式
+    流式转换 JSONL 文件为预计算 tokenize 的二进制格式
+    
+    优化点：
+    1. 流式读取，不一次性加载全部数据到内存
+    2. 批量 tokenize，利用 HuggingFace tokenizer 的并行能力
+    3. 单进程避免进程间通信开销
     
     Args:
         input_file: 输入的 JSONL 文件
         output_prefix: 输出文件前缀 (会生成 .bin 和 .idx 文件)
         tokenizer_name: tokenizer 名称
         max_seq_length: 最大序列长度
-        num_workers: 并行处理的工作进程数
-        chunk_size: 每个工作进程处理的样本数
-        shuffle: 是否打乱数据
+        batch_size: 批处理大小（每批 tokenize 的样本数）
+        shuffle: 是否打乱数据（需要先统计行数）
         seed: 随机种子
     """
-    if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)
-    
-    print(f"Converting {input_file} to tokenized binary format")
+    print(f"Converting {input_file} to tokenized binary format (streaming mode)")
     print(f"  Tokenizer: {tokenizer_name}")
     print(f"  Max sequence length: {max_seq_length}")
-    print(f"  Workers: {num_workers}")
-    print(f"  Chunk size: {chunk_size}")
+    print(f"  Batch size: {batch_size}")
     
-    # 读取所有行
-    print("Reading input file...")
+    # 加载 tokenizer（只加载一次）
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    
+    # 统计行数（用于进度条和打乱）
+    print("Counting lines...")
+    total_lines = 0
     with open(input_file, 'r', encoding='utf-8') as f:
-        lines = [line for line in f if line.strip()]
+        for _ in f:
+            total_lines += 1
+    print(f"Total lines: {total_lines}")
     
-    total_lines = len(lines)
-    print(f"Total samples: {total_lines}")
-    
-    # 打乱数据
+    # 如果需要打乱，生成打乱的索引
+    line_indices = list(range(total_lines))
     if shuffle:
         random.seed(seed)
-        random.shuffle(lines)
-        print("Data shuffled")
-    
-    # 分块
-    chunks = []
-    for i in range(0, total_lines, chunk_size):
-        chunk_lines = lines[i:i + chunk_size]
-        chunks.append((i // chunk_size, chunk_lines))
-    
-    print(f"Split into {len(chunks)} chunks")
+        random.shuffle(line_indices)
+        print("Shuffle indices generated")
     
     # 创建写入器
     writer = TokenizedDataWriter(output_prefix, max_seq_length)
     
-    # 多进程处理
-    process_fn = partial(
-        process_chunk,
-        tokenizer_name=tokenizer_name,
-        max_seq_length=max_seq_length,
-    )
-    
-    total_written = 0
-    
-    if num_workers > 1:
-        with Pool(num_workers) as pool:
-            for results in tqdm(
-                pool.imap(process_fn, chunks),
-                total=len(chunks),
-                desc="Processing chunks"
-            ):
-                for sample in results:
-                    writer.write_sample(sample)
+    # 如果打乱，需要读取所有行的偏移（用于随机访问）
+    if shuffle:
+        print("Building line offset index for random access...")
+        line_offsets = []
+        with open(input_file, 'rb') as f:
+            offset = 0
+            for _ in tqdm(range(total_lines), desc="Indexing"):
+                line_offsets.append(offset)
+                line = f.readline()
+                offset += len(line)
+        print("Index built")
+        
+        # 按打乱顺序处理
+        total_written = 0
+        batch = []
+        
+        with open(input_file, 'r', encoding='utf-8') as f:
+            for i in tqdm(line_indices, desc="Processing"):
+                # 跳到指定行
+                f.seek(line_offsets[i])
+                line = f.readline().strip()
+                
+                if not line:
+                    continue
+                
+                try:
+                    sample = json.loads(line)
+                    if 'source' in sample and 'op_labels' in sample:
+                        batch.append(sample)
+                except json.JSONDecodeError:
+                    continue
+                
+                # 批量处理
+                if len(batch) >= batch_size:
+                    results = tokenize_batch(batch, tokenizer, max_seq_length)
+                    for result in results:
+                        if result is not None:
+                            writer.write_sample(result)
+                            total_written += 1
+                    batch = []
+        
+        # 处理剩余批次
+        if batch:
+            results = tokenize_batch(batch, tokenizer, max_seq_length)
+            for result in results:
+                if result is not None:
+                    writer.write_sample(result)
                     total_written += 1
     else:
-        # 单进程模式
-        for chunk in tqdm(chunks, desc="Processing chunks"):
-            results = process_fn(chunk)
-            for sample in results:
-                writer.write_sample(sample)
-                total_written += 1
+        # 顺序处理（更快，不需要索引）
+        total_written = 0
+        batch = []
+        
+        with open(input_file, 'r', encoding='utf-8') as f:
+            for line in tqdm(f, total=total_lines, desc="Processing"):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    sample = json.loads(line)
+                    if 'source' in sample and 'op_labels' in sample:
+                        batch.append(sample)
+                except json.JSONDecodeError:
+                    continue
+                
+                # 批量处理
+                if len(batch) >= batch_size:
+                    results = tokenize_batch(batch, tokenizer, max_seq_length)
+                    for result in results:
+                        if result is not None:
+                            writer.write_sample(result)
+                            total_written += 1
+                    batch = []
+        
+        # 处理剩余批次
+        if batch:
+            results = tokenize_batch(batch, tokenizer, max_seq_length)
+            for result in results:
+                if result is not None:
+                    writer.write_sample(result)
+                    total_written += 1
     
     writer.close()
     
@@ -333,7 +369,7 @@ def convert_jsonl_to_tokenized(
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="生成预计算 tokenize 的训练数据")
+    parser = argparse.ArgumentParser(description="生成预计算 tokenize 的训练数据（流式处理版）")
     
     parser.add_argument("--input_file", type=str, required=True,
                         help="输入的 JSONL 文件（由 generate_training_data.py 生成）")
@@ -343,24 +379,21 @@ def main():
                         help="Tokenizer 名称或路径")
     parser.add_argument("--max_seq_length", type=int, default=128,
                         help="最大序列长度")
-    parser.add_argument("--num_workers", type=int, default=None,
-                        help="并行工作进程数（默认: CPU核心数-2）")
-    parser.add_argument("--chunk_size", type=int, default=10000,
-                        help="每个进程处理的样本数")
+    parser.add_argument("--batch_size", type=int, default=1000,
+                        help="批处理大小（每批 tokenize 的样本数）")
     parser.add_argument("--no_shuffle", action="store_true",
-                        help="不打乱数据")
+                        help="不打乱数据（顺序处理更快）")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子")
     
     args = parser.parse_args()
     
-    convert_jsonl_to_tokenized(
+    convert_jsonl_to_tokenized_streaming(
         input_file=args.input_file,
         output_prefix=args.output_prefix,
         tokenizer_name=args.tokenizer,
         max_seq_length=args.max_seq_length,
-        num_workers=args.num_workers,
-        chunk_size=args.chunk_size,
+        batch_size=args.batch_size,
         shuffle=not args.no_shuffle,
         seed=args.seed,
     )
@@ -368,3 +401,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
