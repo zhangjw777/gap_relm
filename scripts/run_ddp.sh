@@ -34,11 +34,19 @@ USE_FP16=true                              # 使用FP16混合精度（推荐）
 USE_BF16=false                             # 使用BF16混合精度（如果GPU支持）
 
 # ========== 数据加载 ==========
-NUM_WORKERS=16                              # 数据加载进程数（建议 4-16，在线增强时增大）
+NUM_WORKERS=4                              # 数据加载进程数（建议 4-16，在线增强时增大）
 PREFETCH_FACTOR=4                          # 每个worker预取的batch数（默认2，可增大到4-8）
 CACHE_DIR="./cache"                        # 缓存目录
 USE_CACHE=true                             # 是否使用缓存
 LAZY_LOAD=true                            # 惰性加载模式（推荐大数据集>100万样本使用，节省内存）
+
+# ========== 预计算 tokenize 数据（最高效模式） ==========
+# 如果使用预计算的二进制数据，设置 USE_TOKENIZED_DATA=true
+# 并指定数据文件前缀（不含 .bin/.idx 后缀）
+USE_TOKENIZED_DATA=true                   # 是否使用预计算 tokenize 数据
+TRAIN_DATA_PREFIX="./tokenized_data/train"                       # 训练数据前缀，如 ./tokenized_data/train
+DEV_DATA_PREFIX="./tokenized_data/dev"                         # 验证数据前缀，如 ./tokenized_data/dev
+TEST_DATA_PREFIX="./tokenized_data/test"                        # 测试数据前缀（可选）
 
 # ========== 在线动态数据增强 ==========
 # 注意：使用预生成静态数据时，设置 ONLINE_AUGMENT=false
@@ -212,6 +220,22 @@ while [[ $# -gt 0 ]]; do
             FULL_MASK_MODE=false
             shift
             ;;
+        --tokenized_data)
+            USE_TOKENIZED_DATA=true
+            shift
+            ;;
+        --train_data_prefix)
+            TRAIN_DATA_PREFIX="$2"
+            shift 2
+            ;;
+        --dev_data_prefix)
+            DEV_DATA_PREFIX="$2"
+            shift 2
+            ;;
+        --test_data_prefix)
+            TEST_DATA_PREFIX="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             echo "Available options:"
@@ -251,6 +275,12 @@ while [[ $# -gt 0 ]]; do
             echo "MASK 模式选项:"
             echo "  --full_mask_mode             Full MASK 模式（ReLM 风格，默认）"
             echo "  --sparse_mask_mode           稀疏 MASK 模式（只在编辑位置放 MASK）"
+            echo ""
+            echo "预计算 tokenize 数据选项（最高效模式）:"
+            echo "  --tokenized_data             使用预计算的二进制数据"
+            echo "  --train_data_prefix <path>   训练数据前缀（不含 .bin/.idx）"
+            echo "  --dev_data_prefix <path>     验证数据前缀（不含 .bin/.idx）"
+            echo "  --test_data_prefix <path>    测试数据前缀（可选）"
             exit 1
             ;;
     esac
@@ -323,7 +353,13 @@ echo "  Full MASK模式: $FULL_MASK_MODE"
 echo ""
 echo "【在线动态增强】"
 echo "  启用在线增强: $ONLINE_AUGMENT"
-if [ "$ONLINE_AUGMENT" = true ]; then
+if [ "$USE_TOKENIZED_DATA" = true ]; then
+    echo ""
+    echo "【预计算 tokenize 数据】"
+    echo "  训练数据前缀: $TRAIN_DATA_PREFIX"
+    echo "  验证数据前缀: ${DEV_DATA_PREFIX:-None}"
+    echo "  测试数据前缀: ${TEST_DATA_PREFIX:-None}"
+elif [ "$ONLINE_AUGMENT" = true ]; then
     echo "  干净训练文件: ${CLEAN_TRAIN_FILE:-$TRAIN_FILE}"
     echo "  固定验证集:   ${FROZEN_DEV_FILE:-$DEV_FILE}"
     echo "  造错概率:     $P_CORRUPT"
@@ -421,20 +457,38 @@ else
     CMD="$CMD --sparse_mask_mode"
 fi
 
+# 预计算 tokenize 数据配置（最高效模式）
+if [ "$USE_TOKENIZED_DATA" = true ]; then
+    CMD="$CMD --tokenized_data"
+
+    if [ -n "$TRAIN_DATA_PREFIX" ]; then
+        CMD="$CMD --train_data_prefix \"$TRAIN_DATA_PREFIX\""
+    else
+        echo "❌ Error: --train_data_prefix is required when using --tokenized_data"
+        exit 1
+    fi
+
+    if [ -n "$DEV_DATA_PREFIX" ]; then
+        CMD="$CMD --dev_data_prefix \"$DEV_DATA_PREFIX\""
+    fi
+
+    if [ -n "$TEST_DATA_PREFIX" ]; then
+        CMD="$CMD --test_data_prefix \"$TEST_DATA_PREFIX\""
+    fi
 # 在线动态数据增强配置
-if [ "$ONLINE_AUGMENT" = true ]; then
+elif [ "$ONLINE_AUGMENT" = true ]; then
     CMD="$CMD --online_augment"
-    
+
     # 干净训练文件（如果指定）
     if [ -n "$CLEAN_TRAIN_FILE" ]; then
         CMD="$CMD --clean_train_file \"$CLEAN_TRAIN_FILE\""
     fi
-    
+
     # 固定验证集（如果指定）
     if [ -n "$FROZEN_DEV_FILE" ]; then
         CMD="$CMD --frozen_dev_file \"$FROZEN_DEV_FILE\""
     fi
-    
+
     # 造错参数
     CMD="$CMD --p_corrupt $P_CORRUPT"
     CMD="$CMD --base_lambda $BASE_LAMBDA"
@@ -442,7 +496,7 @@ if [ "$ONLINE_AUGMENT" = true ]; then
     CMD="$CMD --pi_multiply $PI_MULTIPLY"
     CMD="$CMD --pi_replace $PI_REPLACE"
     CMD="$CMD --clean_file_format $CLEAN_FILE_FORMAT"
-    
+
     # 长度自适应配置
     if [ "$ENABLE_LENGTH_ADAPTIVE" = true ]; then
         CMD="$CMD --enable_length_adaptive"
@@ -453,10 +507,11 @@ if [ "$ONLINE_AUGMENT" = true ]; then
     else
         CMD="$CMD --no_length_adaptive"
     fi
+# 静态数据模式（不使用预计算 tokenize，也不使用在线增强）
 else
     CMD="$CMD --no_online_augment"
-    
-    # 惰性加载（仅在静态数据模式下生效）
+
+    # 惰性加载（仅在静态 JSONL 数据模式下生效）
     if [ "$LAZY_LOAD" = true ]; then
         CMD="$CMD --lazy_load"
     fi

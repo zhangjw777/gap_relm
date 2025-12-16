@@ -1,6 +1,101 @@
 # Gap-ReLM 项目修改计划
 
-## 最后修改日期：2025-01-XX
+## 最后修改日期：2025-12-16
+
+---
+
+## 〇-3、CPU 瓶颈修复与数据加载优化（2025-12-16 新增）
+
+### 问题背景
+使用预计算 tokenize 二进制数据（TokenizedBinaryDataset）+ DDP 双卡训练 + num_workers=16 时：
+- 训练速度只有 1.41s/it，远低于预期
+- GPU 功率使用很低（4090 只用了 130W，满载 400W+）
+- CPU 空闲率 92%，说明 DataLoader workers 没有并行工作
+- 环境：WSL2 + conda + 双 RTX 4090
+
+### 根本原因
+1. **mmap 在 fork 后可能失效**：Linux/WSL2 默认使用 `fork` 启动 worker 进程，mmap 句柄不会正确传递
+2. **numpy 类型转换开销**：`np.frombuffer().copy().astype(np.int64)` 涉及多次内存拷贝
+3. **辅助 MLM 标签生成使用 Python 循环**：`random.sample()` + for 循环逐位赋值
+
+### 代码修改
+
+| 文件 | 修改类型 | 说明 |
+|------|----------|------|
+| `scripts/train.py` | **修改** | 在所有 import 之前添加 `mp.set_start_method('spawn')` |
+| `data/dataset.py` (TokenizedBinaryDataset) | **修改** | 多处优化（见下方详情） |
+| `scripts/test_dataloader_speed.py` | **新增** | 数据加载性能诊断脚本 |
+
+### TokenizedBinaryDataset 优化详情
+
+**1. 索引读取优化（__init__）**
+```python
+# 原来：循环读取每个 offset
+self.offsets = []
+for _ in range(self.num_samples):
+    offset = struct.unpack('<Q', f.read(8))[0]
+    self.offsets.append(offset)
+
+# 优化后：一次性读取为 numpy 数组
+offsets_data = f.read(self.num_samples * 8)
+self.offsets = np.frombuffer(offsets_data, dtype=np.uint64).copy()
+```
+
+**2. 样本读取优化（__getitem__）**
+```python
+# 原来：numpy -> astype -> torch，多次拷贝
+input_ids = np.frombuffer(data, dtype=np.int16).copy()
+input_ids_tensor = torch.from_numpy(input_ids.astype(np.int64))
+
+# 优化后：torch.frombuffer 直接创建 tensor，一步到位
+input_ids_tensor = torch.frombuffer(
+    bytearray(data[ptr:ptr + seq_len * 2]), dtype=torch.int16
+).to(torch.int64)
+```
+
+**3. 辅助 MLM 标签生成优化（_create_aux_mlm_labels）**
+```python
+# 原来：Python 循环 + random.sample
+keep_positions = torch.where(keep_mask)[0].tolist()
+positions_to_mask = random.sample(keep_positions, num_to_mask)
+for pos in positions_to_mask:
+    labels[pos] = input_ids[pos].clone()
+
+# 优化后：纯 PyTorch 向量化操作
+rand_probs = torch.rand(input_ids.size(0))
+rand_probs[~keep_mask] = float('inf')
+_, selected_indices = torch.topk(rand_probs, num_to_mask, largest=False)
+labels[selected_indices] = input_ids[selected_indices]
+```
+
+### 使用方法
+
+**诊断数据加载性能**
+```bash
+# 测试不同 num_workers 配置的性能
+python scripts/test_dataloader_speed.py \
+    --data_prefix ./tokenized_data/train \
+    --batch_size 64 \
+    --num_batches 100
+
+# 测试特定配置
+python scripts/test_dataloader_speed.py \
+    --data_prefix ./tokenized_data/train \
+    --num_workers 8 \
+    --prefetch_factor 4
+```
+
+**推荐配置**
+```bash
+# 在 run_ddp.sh 或训练命令中设置
+NUM_WORKERS=8       # 双卡 DDP 时每卡 8 workers
+PREFETCH_FACTOR=4   # 预取 4 个 batch
+```
+
+### 注意事项
+1. **WSL2/Linux 环境**：必须在训练脚本开头设置 `mp.set_start_method('spawn')`
+2. **DDP 训练**：`num_workers` 是每个进程的 worker 数，双卡实际有 2 * num_workers 个 workers
+3. **最佳 num_workers**：通常为 CPU 核心数 / GPU 数量 / 2 左右（例如 48 线程双卡用 8-12）
 
 ---
 

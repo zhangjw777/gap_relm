@@ -19,6 +19,7 @@ import random
 import math
 import mmap
 import struct
+import numpy as np
 from tqdm import tqdm
 
 from .label_generator import ProcessedSample, create_sample_processor
@@ -1689,11 +1690,9 @@ class TokenizedBinaryDataset(Dataset):
             self.max_seq_length = struct.unpack('<I', f.read(4))[0]
             self.num_samples = struct.unpack('<Q', f.read(8))[0]
             
-            # 读取偏移数组
-            self.offsets = []
-            for _ in range(self.num_samples):
-                offset = struct.unpack('<Q', f.read(8))[0]
-                self.offsets.append(offset)
+            # 读取偏移数组（使用 numpy 数组以提高访问速度）
+            offsets_data = f.read(self.num_samples * 8)
+            self.offsets = np.frombuffer(offsets_data, dtype=np.uint64).copy()
         
         # 计算每个样本的字节大小
         # input_ids(int16) + attention_mask(int8) + op_labels(int8) + insert_labels(int8)
@@ -1728,54 +1727,60 @@ class TokenizedBinaryDataset(Dataset):
         return self.num_samples
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """获取单个样本（直接从内存映射读取，几乎零开销）"""
+        """获取单个样本（优化版：减少内存拷贝和类型转换）"""
         if self._mmap is None:
-            raise RuntimeError("Memory map not initialized")
+            raise RuntimeError("Memory map not initialized. This may happen when using num_workers > 0.")
         
-        offset = self.offsets[idx]
+        offset = int(self.offsets[idx])  # numpy uint64 -> Python int
         seq_len = self.max_seq_length
         
         # 从内存映射读取二进制数据
         data = self._mmap[offset:offset + self.sample_size]
         
-        # 解析各个字段
+        # 解析各个字段 - 使用 torch.frombuffer 直接创建 tensor，避免 numpy 中间层
+        # 注意：frombuffer 需要 bytes，且创建的是只读视图，需要 clone
         ptr = 0
         
-        # input_ids: int16
-        input_ids = np.frombuffer(data[ptr:ptr + seq_len * 2], dtype=np.int16).copy()
+        # input_ids: int16 -> int64
+        input_ids_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len * 2]), dtype=torch.int16
+        ).to(torch.int64)
         ptr += seq_len * 2
         
-        # attention_mask: int8
-        attention_mask = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        # attention_mask: int8 -> int64
+        attention_mask_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len]), dtype=torch.int8
+        ).to(torch.int64)
         ptr += seq_len
         
-        # op_labels: int8
-        op_labels = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        # op_labels: int8 -> int64
+        op_labels_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len]), dtype=torch.int8
+        ).to(torch.int64)
         ptr += seq_len
         
-        # insert_labels: int8
-        insert_labels = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        # insert_labels: int8 -> int64
+        insert_labels_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len]), dtype=torch.int8
+        ).to(torch.int64)
         ptr += seq_len
         
-        # template_input_ids: int16
-        template_input_ids = np.frombuffer(data[ptr:ptr + seq_len * 2], dtype=np.int16).copy()
+        # template_input_ids: int16 -> int64
+        template_input_ids_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len * 2]), dtype=torch.int16
+        ).to(torch.int64)
         ptr += seq_len * 2
         
-        # template_attention_mask: int8
-        template_attention_mask = np.frombuffer(data[ptr:ptr + seq_len], dtype=np.int8).copy()
+        # template_attention_mask: int8 -> int64
+        template_attention_mask_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len]), dtype=torch.int8
+        ).to(torch.int64)
         ptr += seq_len
         
-        # infill_labels: int16
-        infill_labels = np.frombuffer(data[ptr:ptr + seq_len * 2], dtype=np.int16).copy()
-        
-        # 转换为 PyTorch tensor
-        input_ids_tensor = torch.from_numpy(input_ids.astype(np.int64))
-        attention_mask_tensor = torch.from_numpy(attention_mask.astype(np.int64))
-        op_labels_tensor = torch.from_numpy(op_labels.astype(np.int64))
-        insert_labels_tensor = torch.from_numpy(insert_labels.astype(np.int64))
-        template_input_ids_tensor = torch.from_numpy(template_input_ids.astype(np.int64))
-        template_attention_mask_tensor = torch.from_numpy(template_attention_mask.astype(np.int64))
-        infill_labels_tensor = torch.from_numpy(infill_labels.astype(np.int64))
+        # infill_labels: int16 -> int64
+        infill_labels_tensor = torch.frombuffer(
+            bytearray(data[ptr:ptr + seq_len * 2]), dtype=torch.int16
+        ).to(torch.int64)
         
         # 辅助 MLM（可选，训练时随机 mask KEEP 位置）
         aux_mlm_labels = None
@@ -1801,20 +1806,31 @@ class TokenizedBinaryDataset(Dataset):
         input_ids: torch.Tensor,
         op_labels: torch.Tensor
     ) -> torch.Tensor:
-        """创建辅助 MLM 标签（训练时随机 mask）"""
-        labels = torch.full_like(input_ids, -100)
-        
-        # 找出 KEEP 位置（op_labels == 0，且不是 padding）
-        # op_labels 中 -100 是 padding/special token
+        """创建辅助 MLM 标签（优化版：使用向量化操作）"""
+        # 找出 KEEP 位置（op_labels == 0）
         keep_mask = (op_labels == 0)
-        keep_positions = torch.where(keep_mask)[0].tolist()
+        num_keep = keep_mask.sum().item()
         
-        # 随机选择要 mask 的位置
-        num_to_mask = int(len(keep_positions) * self.aux_mlm_prob)
-        if num_to_mask > 0 and keep_positions:
-            positions_to_mask = random.sample(keep_positions, min(num_to_mask, len(keep_positions)))
-            for pos in positions_to_mask:
-                labels[pos] = input_ids[pos].clone()
+        if num_keep == 0:
+            return torch.full_like(input_ids, -100)
+        
+        # 计算要 mask 的数量
+        num_to_mask = int(num_keep * self.aux_mlm_prob)
+        
+        if num_to_mask == 0:
+            return torch.full_like(input_ids, -100)
+        
+        # 使用 torch 的随机选择（向量化，避免 Python 循环）
+        # 生成随机概率，选择概率最低的 num_to_mask 个位置
+        rand_probs = torch.rand(input_ids.size(0))
+        rand_probs[~keep_mask] = float('inf')  # 非 KEEP 位置设为无穷大，不会被选中
+        
+        # 选择概率最小的 num_to_mask 个位置
+        _, selected_indices = torch.topk(rand_probs, num_to_mask, largest=False)
+        
+        # 创建标签
+        labels = torch.full_like(input_ids, -100)
+        labels[selected_indices] = input_ids[selected_indices]
         
         return labels
     

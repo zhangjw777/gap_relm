@@ -11,6 +11,14 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# 重要：在 DDP + num_workers > 0 时，必须在其他 import 之前设置 multiprocessing 启动方法
+# WSL2/Linux 环境下使用 spawn 可避免 fork 后 mmap 失效的问题
+import torch.multiprocessing as mp
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # 已经设置过了
+
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
