@@ -64,6 +64,11 @@ ENABLE_INSERT=true                         # 启用插入操作
 ENABLE_DELETE=true                         # 启用删除操作
 ENABLE_AUX_MLM=true                        # 启用辅助MLM任务
 
+# ========== MASK 模式 ==========
+# Full MASK 模式（ReLM 风格）：模板格式为 [CLS] source [SEP] [MASK]*N [SEP]
+# 稀疏 MASK 模式：只在编辑位置放置 [MASK]
+FULL_MASK_MODE=true                        # true=Full MASK模式（默认），false=稀疏MASK模式
+
 # ========== P-Tuning 配置 ==========
 ENABLE_PTUNING=true                        # 启用P-Tuning（默认开启）
 PTUNING_PROMPT_LENGTH=10                   # Prompt长度
@@ -199,6 +204,14 @@ while [[ $# -gt 0 ]]; do
             LAZY_LOAD=true
             shift
             ;;
+        --full_mask_mode)
+            FULL_MASK_MODE=true
+            shift
+            ;;
+        --sparse_mask_mode)
+            FULL_MASK_MODE=false
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             echo "Available options:"
@@ -234,6 +247,10 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "大数据集内存优化选项:"
             echo "  --lazy_load                  启用惰性加载（推荐>100万样本数据集使用）"
+            echo ""
+            echo "MASK 模式选项:"
+            echo "  --full_mask_mode             Full MASK 模式（ReLM 风格，默认）"
+            echo "  --sparse_mask_mode           稀疏 MASK 模式（只在编辑位置放 MASK）"
             exit 1
             ;;
     esac
@@ -302,6 +319,7 @@ echo "  P-Tuning: $ENABLE_PTUNING"
 echo "  Prompt长度: $PTUNING_PROMPT_LENGTH"
 echo "  F2优化:   $ENABLE_F2"
 echo "  FP16:     $USE_FP16"
+echo "  Full MASK模式: $FULL_MASK_MODE"
 echo ""
 echo "【在线动态增强】"
 echo "  启用在线增强: $ONLINE_AUGMENT"
@@ -395,6 +413,13 @@ if [ "$PTUNING_SHARED" = true ]; then
 fi
 
 CMD="$CMD --ptuning_prompt_length $PTUNING_PROMPT_LENGTH"
+
+# MASK 模式配置
+if [ "$FULL_MASK_MODE" = true ]; then
+    CMD="$CMD --full_mask_mode"
+else
+    CMD="$CMD --sparse_mask_mode"
+fi
 
 # 在线动态数据增强配置
 if [ "$ONLINE_AUGMENT" = true ]; then

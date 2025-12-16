@@ -46,6 +46,7 @@ def create_data_loaders(
     world_size: int = 1,
     rank: int = 0,
     lazy_load: bool = False,
+    full_mask_mode: bool = True,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], AutoTokenizer]:
     """
     创建训练、验证、测试数据加载器
@@ -73,6 +74,7 @@ def create_data_loaders(
         world_size: 分布式世界大小
         rank: 当前进程排名
         lazy_load: 是否使用惰性加载模式（推荐大数据集使用，节省内存）
+        full_mask_mode: 是否使用 full MASK 模式（ReLM style）
         
     Returns:
         (train_loader, dev_loader, test_loader, tokenizer)
@@ -98,6 +100,7 @@ def create_data_loaders(
             'aux_mlm_prob': aux_mlm_prob,
             'index_cache_dir': cache_dir,
             'use_index_cache': use_cache,
+            'full_mask_mode': full_mask_mode,
         }
         train_dataset = LazyGapReLMDataset(data_file=train_file, **lazy_dataset_kwargs)
     else:
@@ -115,6 +118,7 @@ def create_data_loaders(
             'normalize_text': normalize_text,
             'enable_aux_mlm': enable_aux_mlm,
             'aux_mlm_prob': aux_mlm_prob,
+            'full_mask_mode': full_mask_mode,
         }
         train_dataset = GapReLMDataset(data_file=train_file, **dataset_kwargs)
     
@@ -161,6 +165,7 @@ def create_data_loaders(
         'normalize_text': normalize_text,
         'enable_aux_mlm': enable_aux_mlm,
         'aux_mlm_prob': aux_mlm_prob,
+        'full_mask_mode': full_mask_mode,
     }
     
     # 验证数据加载器
@@ -276,6 +281,8 @@ def create_online_data_loaders(
     # 干净文件格式
     clean_file_format: str = "txt",
     clean_text_field: str = "text",
+    # MASK 模式
+    full_mask_mode: bool = True,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], AutoTokenizer]:
     """
     创建在线动态增强的数据加载器
@@ -322,6 +329,7 @@ def create_online_data_loaders(
         rank: 当前进程排名
         clean_file_format: 干净文件格式
         clean_text_field: JSON 中的文本字段名
+        full_mask_mode: 是否使用 full MASK 模式（ReLM style）
         
     Returns:
         (train_loader, dev_loader, test_loader, tokenizer)
@@ -371,6 +379,7 @@ def create_online_data_loaders(
         use_default_pinyin_confusion=use_default_pinyin_confusion,
         custom_confusion_files=custom_confusion_files,
         enable_protection=enable_protection,
+        full_mask_mode=full_mask_mode,
     )
     
     # 训练数据加载器
@@ -420,6 +429,7 @@ def create_online_data_loaders(
             'normalize_text': normalize_text,
             'enable_aux_mlm': enable_aux_mlm,
             'aux_mlm_prob': aux_mlm_prob,
+            'full_mask_mode': full_mask_mode,
         }
         dev_dataset = GapReLMDataset(data_file=frozen_dev_file, **dataset_kwargs)
         
@@ -464,6 +474,7 @@ def create_online_data_loaders(
             'normalize_text': normalize_text,
             'enable_aux_mlm': enable_aux_mlm,
             'aux_mlm_prob': aux_mlm_prob,
+            'full_mask_mode': full_mask_mode,
         }
         test_dataset = GapReLMDataset(data_file=test_file, **dataset_kwargs)
         

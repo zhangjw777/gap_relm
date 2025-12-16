@@ -1,6 +1,88 @@
 # Gap-ReLM 项目修改计划
 
-## 最后修改日期：2025-12-15
+## 最后修改日期：2025-01-XX
+
+---
+
+## 〇-2、Full MASK 模式重构（2025-01-XX 新增 ✅）
+
+### 问题背景
+Gap-ReLM 原设计使用 **稀疏 MASK 模式**：模板中只在编辑位置放置 `[MASK]`，Infiller 只需要预测这些位置。
+
+为了与原版 ReLM (AAAI 2024) 的设计保持一致并便于对比实验，需要支持 **Full MASK 模式**：
+- 模板格式：`[CLS] [P] source [SEP] [P] [MASK]*N [SEP]`
+- Infiller 需要预测完整的目标序列（N 个 token）
+- N 由 Planner 的 KEEP/REPLACE/DELETE/INSERT 预测推断
+
+### 核心设计
+
+**Target 长度计算规则**：
+- KEEP (0): +1
+- REPLACE (2): +1
+- DELETE (1): +0
+- INSERT: 每个非 DELETE 位置 +insert_labels[i]
+
+**模板格式**：
+```
+稀疏模式: [CLS] source_with_mask [SEP]
+         例：[CLS] 我 [MASK] 北京 [SEP]
+
+Full模式: [CLS] source [SEP] [MASK]*N [SEP]
+         例：[CLS] 我 去 北京 [SEP] [MASK] [MASK] [MASK] [MASK] [SEP]
+```
+
+**Infiller 标签**：
+- 稀疏模式：只在 `[MASK]` 位置有标签
+- Full 模式：`[MASK]*N` 区域全部有标签（目标序列的 token IDs）
+
+### 代码修改
+
+| 文件 | 修改类型 | 说明 |
+|------|----------|------|
+| `config.py` | **修改** | `AblationConfig` 添加 `full_mask_mode: bool = True` |
+| `models/template_builder.py` | **修改** | 添加 `FullMaskTemplateResult`, `compute_target_length()`, `build_full_mask_template()`, `build_full_mask_template_from_predictions()` |
+| `models/gap_relm.py` | **修改** | `forward()` 添加 `target_ids`, `target_length`, `target_start_pos` 参数；`predict()` 支持 full MASK 解码 |
+| `data/dataset.py` | **修改** | `GapReLMDataset`, `LazyGapReLMDataset`, `OnlineAugmentedDataset` 添加 `full_mask_mode` 参数和 `_convert_to_full_mask_features()` 方法 |
+| `data/data_loader.py` | **修改** | `create_data_loaders()`, `create_online_data_loaders()` 添加 `full_mask_mode` 参数 |
+| `scripts/generate_tokenized_data.py` | **修改** | 添加 `tokenize_batch_full_mask()`, `--full_mask_mode`/`--sparse_mask_mode` 参数 |
+| `scripts/train.py` | **修改** | 添加 `--full_mask_mode`/`--sparse_mask_mode` 命令行参数 |
+
+### 使用方法
+
+**训练时选择 MASK 模式**：
+```bash
+# Full MASK 模式（默认，ReLM 风格）
+python scripts/train.py \
+    --train_file data/train.jsonl \
+    --full_mask_mode \
+    ...
+
+# 稀疏 MASK 模式（原 Gap-ReLM 风格）
+python scripts/train.py \
+    --train_file data/train.jsonl \
+    --sparse_mask_mode \
+    ...
+```
+
+**生成预计算 tokenize 数据时选择模式**：
+```bash
+# Full MASK 模式
+python scripts/generate_tokenized_data.py \
+    --input_file train.jsonl \
+    --output_prefix train_full \
+    --full_mask_mode
+
+# 稀疏 MASK 模式
+python scripts/generate_tokenized_data.py \
+    --input_file train.jsonl \
+    --output_prefix train_sparse \
+    --sparse_mask_mode
+```
+
+### 注意事项
+1. **数据兼容性**：预计算 tokenize 的二进制数据在生成时确定 MASK 模式，训练时必须使用相同模式
+2. **默认值**：`full_mask_mode=True`（默认使用 Full MASK 模式）
+3. **P-Tuning**：两种模式均支持 P-Tuning，虚拟 token 会添加在 source 之前
 
 ---
 
@@ -624,25 +706,7 @@ __getitem__(idx) 被调用时:
   - 每次验证数据相同，确保曲线可比
 ```
 
----
 
-## 三、待办事项
-
-### 3.1 后续优化（可选）
-- [ ] 实现方案 C：共享域 prompt + 任务独立 prompt（分层）
-- [ ] 添加 prompt 初始化策略选项（随机、从词表采样等）
-- [ ] 支持 deep prompt tuning（每层都有 prompt）
-- [ ] 添加更多错误类型（如语序错误）
-- [ ] 实现基于困惑度的自适应造错
-
-### 3.2 测试验证
-- [ ] 在服务器上运行测试，验证代码正确性
-- [ ] 进行消融实验，对比有无 P-Tuning 的性能差异
-- [ ] 对比在线增强 vs 静态数据的训练效果
-- [ ] 验证长度自适应 λ 的效果
-- [ ] 记录实验结果
-
----
 
 ## 〇-1、内存溢出问题修复 - 惰性加载数据集（2025-12-15 新增 ✅）
 

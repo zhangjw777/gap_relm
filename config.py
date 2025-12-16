@@ -184,6 +184,16 @@ class AblationConfig:
     enable_insert: bool = True           # 启用插入操作
     enable_delete: bool = True           # 启用删除操作
     
+    # ========== MASK 模式配置 ==========
+    # full_mask_mode=True: 全 MASK 模式（类似原版 ReLM）
+    #   - Infiller 输入: [CLS] [P] source [SEP] [P] [MASK]*N [SEP]
+    #   - Infiller 并行预测整个 target 序列
+    #   - N 由 Planner 的 KEEP/REPLACE/DELETE/INSERT 预测计算得出
+    # full_mask_mode=False: 稀疏 MASK 模式（原 Gap-ReLM）
+    #   - Infiller 输入: [CLS] template_with_sparse_masks [SEP]
+    #   - 只在需要修改的位置放置 [MASK]
+    full_mask_mode: bool = True          # 默认使用全 MASK 模式
+    
     # P-Tuning 配置（论文中对性能有贡献）
     enable_ptuning: bool = True          # 启用 P-Tuning（默认开启）
     ptuning_prompt_length: int = 10      # Prompt 长度（虚拟 token 数量）

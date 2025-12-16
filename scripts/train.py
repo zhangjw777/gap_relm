@@ -126,6 +126,13 @@ def parse_args():
     parser.add_argument("--enable_verifier", action="store_true",
                         help="Enable verifier")
     
+    # Full MASK 模式（ReLM 风格）
+    mask_mode_group = parser.add_mutually_exclusive_group()
+    mask_mode_group.add_argument("--full_mask_mode", action="store_true", default=True,
+                                  help="Use full MASK mode (ReLM style: [CLS] src [SEP] [MASK]*N [SEP]) (default)")
+    mask_mode_group.add_argument("--sparse_mask_mode", action="store_true",
+                                  help="Use sparse MASK mode (only MASK at edit positions)")
+    
     # P-Tuning 配置
     parser.add_argument("--no_ptuning", action="store_true",
                         help="Disable P-Tuning (for ablation study)")
@@ -340,6 +347,9 @@ def main():
     config.ablation.enable_iterative_refinement = args.enable_refinement
     config.ablation.enable_verifier = args.enable_verifier
     
+    # Full MASK 模式配置（ReLM 风格）
+    config.ablation.full_mask_mode = not args.sparse_mask_mode
+    
     # P-Tuning 配置
     config.ablation.enable_ptuning = not args.no_ptuning
     config.ablation.ptuning_prompt_length = args.ptuning_prompt_length
@@ -442,6 +452,8 @@ def main():
             # 文件格式
             clean_file_format=args.clean_file_format,
             clean_text_field=args.clean_text_field,
+            # MASK 模式
+            full_mask_mode=config.ablation.full_mask_mode,
         )
     else:
         # 静态数据模式（使用预生成的训练数据）
@@ -471,6 +483,7 @@ def main():
             world_size=world_size if is_distributed else 1,
             rank=rank if is_distributed else 0,
             lazy_load=args.lazy_load,
+            full_mask_mode=config.ablation.full_mask_mode,
         )
     
     if is_main_process:

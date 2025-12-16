@@ -2,6 +2,10 @@
 Gap-ReLM 主模型
 整合 Encoder、Planner、Template Builder、Infiller、Verifier
 支持 P-Tuning 消融实验
+
+支持两种 MASK 模式:
+1. 稀疏 MASK 模式 (full_mask_mode=False): [CLS] template_with_sparse_masks [SEP]
+2. 全 MASK 模式 (full_mask_mode=True): [CLS] [P] source [SEP] [P] [MASK]*N [SEP]
 """
 
 import torch
@@ -12,7 +16,7 @@ from transformers import BertModel, BertConfig, AutoModel
 
 from .planner import EditPlanner, PlannerOutput, create_f2_weights
 from .infiller import ReLMInfiller, InfillerOutput
-from .template_builder import TemplateBuilder, InferenceTemplateBuilder
+from .template_builder import TemplateBuilder, InferenceTemplateBuilder, FullMaskTemplateResult
 from .verifier import Verifier
 from .ptuning import PTuningEncoder, TaskSpecificPTuning
 
@@ -306,6 +310,10 @@ class GapReLMModel(nn.Module):
         infill_labels: Optional[torch.Tensor] = None,
         aux_mlm_labels: Optional[torch.Tensor] = None,
         training_stage: str = "joint",
+        # 全 MASK 模式额外参数
+        target_ids: Optional[torch.Tensor] = None,  # [batch, target_len]，用于全 MASK 模式的 gold target
+        target_length: Optional[torch.Tensor] = None,  # [batch]，target 长度
+        target_start_pos: Optional[torch.Tensor] = None,  # [batch]，target 在 template 中的起始位置
         **kwargs
     ) -> GapReLMOutput:
         """
@@ -317,10 +325,17 @@ class GapReLMModel(nn.Module):
             op_labels: 操作标签 [batch, seq_len]
             insert_labels: 插入标签 [batch, seq_len]
             template_input_ids: 模板 IDs [batch, template_len]
+                稀疏 MASK 模式: [CLS] sparse_template [SEP]
+                全 MASK 模式: [CLS] source [SEP] [MASK]*N [SEP]
             template_attention_mask: 模板掩码 [batch, template_len]
             infill_labels: Infiller 标签 [batch, template_len]
+                稀疏 MASK 模式: 只有 [MASK] 位置有有效标签
+                全 MASK 模式: target 区域全部有效标签
             aux_mlm_labels: 辅助 MLM 标签 [batch, seq_len]
             training_stage: 训练阶段 ("planner", "infiller", "joint")
+            target_ids: 全 MASK 模式的 gold target [batch, max_target_len]
+            target_length: 全 MASK 模式的 target 长度 [batch]
+            target_start_pos: 全 MASK 模式的 target 起始位置 [batch]
             
         Returns:
             GapReLMOutput
@@ -368,9 +383,11 @@ class GapReLMModel(nn.Module):
         
         # Infiller 前向
         if training_stage in ["infiller", "joint"] and template_input_ids is not None:
-            # 注意：aux_mlm_labels 是基于源序列生成的，形状是 [batch, seq_len]
-            # 但 Infiller 的输入是模板序列，形状可能是 [batch, template_len]
-            # 两者长度可能不同，因此 aux_mlm_loss 应该在源序列上单独计算
+            # 全 MASK 模式和稀疏 MASK 模式共用相同的 Infiller 前向逻辑
+            # 区别在于数据输入格式：
+            # - 稀疏 MASK: template_input_ids 包含稀疏的 [MASK]，infill_labels 只在 [MASK] 位置有效
+            # - 全 MASK: template_input_ids = [CLS] source [SEP] [MASK]*N [SEP]
+            #            infill_labels 在 target 区域（[MASK]*N）全部有效
             
             # 如果启用 P-Tuning，需要先编码模板
             if self.ablation_config.enable_ptuning:
@@ -488,65 +505,105 @@ class GapReLMModel(nn.Module):
             insert_threshold=self.f2_config.insert_threshold if self.f2_config.enable_threshold_calibration else 0,
         )
         
-        # 构建模板
+        # 构建模板（根据模式选择构建方式）
         template_builder = InferenceTemplateBuilder(
             tokenizer=tokenizer,
             max_seq_length=self.model_config.max_seq_length,
             max_insert_per_sentence=self.f2_config.max_insert_per_sentence,
             max_insert_ratio=self.f2_config.max_insert_ratio,
+            full_mask_mode=self.ablation_config.full_mask_mode,
         )
         
-        template_result = template_builder.build_template(
-            input_ids, attention_mask, op_preds, insert_preds
-        )
-        
-        # Infiller 预测（带 P-Tuning）
-        predictions, confidence = self._infiller_predict_with_ptuning(
-            template_result.template_ids,
-            template_result.template_mask,
-            mask_token_id=tokenizer.mask_token_id
-        )
-        
-        # 迭代精炼
-        if use_iterative_refinement and self.ablation_config.enable_iterative_refinement:
-            for r in range(refinement_rounds):
-                # 创建精炼模板
-                new_template, mask_positions = template_builder.create_refinement_template(
-                    predictions, confidence, refinement_mask_ratio
-                )
-                
-                # 重新预测（带 P-Tuning）
-                predictions, confidence = self._infiller_predict_with_ptuning(
-                    new_template,
-                    template_result.template_mask,
-                    mask_token_id=tokenizer.mask_token_id
-                )
-        
-        # Verifier
-        verifier_accepted = None
-        if use_verifier and self.verifier is not None:
-            verifier_accepted, _ = self.verifier.verify(
-                input_ids, attention_mask,
-                predictions, template_result.template_mask
+        if self.ablation_config.full_mask_mode:
+            # 全 MASK 模式：构建 [CLS] source [SEP] [MASK]*N [SEP]
+            full_mask_result = template_builder.build_full_mask_template_from_predictions(
+                input_ids, attention_mask, op_preds, insert_preds
             )
-        
-        # 解码预测结果
-        decoded_predictions = []
-        for b in range(batch_size):
-            pred_ids = predictions[b]
-            # 移除特殊 token
-            pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
-            decoded_predictions.append(pred_text)
-        
-        return {
-            'predictions': predictions,
-            'decoded_predictions': decoded_predictions,
-            'op_predictions': op_preds,
-            'insert_predictions': insert_preds,
-            'template_ids': template_result.template_ids,
-            'confidence': confidence,
-            'verifier_accepted': verifier_accepted,
-        }
+            
+            # Infiller 预测
+            predictions, confidence = self._infiller_predict_with_ptuning(
+                full_mask_result.input_ids,
+                full_mask_result.attention_mask,
+                mask_token_id=tokenizer.mask_token_id
+            )
+            
+            # 提取 target 部分的预测结果
+            decoded_predictions = []
+            for b in range(batch_size):
+                target_start = full_mask_result.target_start_pos[b].item()
+                target_len = full_mask_result.target_length[b].item()
+                target_end = target_start + target_len
+                
+                pred_ids = predictions[b, target_start:target_end]
+                pred_text = tokenizer.decode(pred_ids, skip_special_tokens=False)
+                # 移除可能的特殊 token
+                pred_text = pred_text.replace('[PAD]', '').replace('[CLS]', '').replace('[SEP]', '').strip()
+                decoded_predictions.append(pred_text)
+            
+            return {
+                'predictions': predictions,
+                'decoded_predictions': decoded_predictions,
+                'op_predictions': op_preds,
+                'insert_predictions': insert_preds,
+                'template_ids': full_mask_result.input_ids,
+                'confidence': confidence,
+                'verifier_accepted': None,
+                'target_start_pos': full_mask_result.target_start_pos,
+                'target_length': full_mask_result.target_length,
+            }
+        else:
+            # 稀疏 MASK 模式（原有逻辑）
+            template_result = template_builder.build_template(
+                input_ids, attention_mask, op_preds, insert_preds
+            )
+            
+            # Infiller 预测（带 P-Tuning）
+            predictions, confidence = self._infiller_predict_with_ptuning(
+                template_result.template_ids,
+                template_result.template_mask,
+                mask_token_id=tokenizer.mask_token_id
+            )
+            
+            # 迭代精炼
+            if use_iterative_refinement and self.ablation_config.enable_iterative_refinement:
+                for r in range(refinement_rounds):
+                    # 创建精炼模板
+                    new_template, mask_positions = template_builder.create_refinement_template(
+                        predictions, confidence, refinement_mask_ratio
+                    )
+                    
+                    # 重新预测（带 P-Tuning）
+                    predictions, confidence = self._infiller_predict_with_ptuning(
+                        new_template,
+                        template_result.template_mask,
+                        mask_token_id=tokenizer.mask_token_id
+                    )
+            
+            # Verifier
+            verifier_accepted = None
+            if use_verifier and self.verifier is not None:
+                verifier_accepted, _ = self.verifier.verify(
+                    input_ids, attention_mask,
+                    predictions, template_result.template_mask
+                )
+            
+            # 解码预测结果
+            decoded_predictions = []
+            for b in range(batch_size):
+                pred_ids = predictions[b]
+                # 移除特殊 token
+                pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+                decoded_predictions.append(pred_text)
+            
+            return {
+                'predictions': predictions,
+                'decoded_predictions': decoded_predictions,
+                'op_predictions': op_preds,
+                'insert_predictions': insert_preds,
+                'template_ids': template_result.template_ids,
+                'confidence': confidence,
+                'verifier_accepted': verifier_accepted,
+            }
     
     def save_pretrained(self, save_path: str):
         """保存模型"""

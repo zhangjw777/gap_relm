@@ -121,6 +121,7 @@ def tokenize_batch(
     samples: List[Dict[str, Any]],
     tokenizer,
     max_seq_length: int,
+    full_mask_mode: bool = False,
 ) -> List[Optional[TokenizedSample]]:
     """
     批量 tokenize 样本（利用 tokenizer 的批处理能力加速）
@@ -129,10 +130,23 @@ def tokenize_batch(
         samples: 样本字典列表
         tokenizer: HuggingFace tokenizer
         max_seq_length: 最大序列长度
+        full_mask_mode: 是否使用全 MASK 模式
     
     Returns:
         TokenizedSample 列表（无效样本为 None）
     """
+    if full_mask_mode:
+        return tokenize_batch_full_mask(samples, tokenizer, max_seq_length)
+    else:
+        return tokenize_batch_sparse_mask(samples, tokenizer, max_seq_length)
+
+
+def tokenize_batch_sparse_mask(
+    samples: List[Dict[str, Any]],
+    tokenizer,
+    max_seq_length: int,
+) -> List[Optional[TokenizedSample]]:
+    """稀疏 MASK 模式的批量 tokenize（原有逻辑）"""
     # 过滤有效样本并收集文本
     valid_indices = []
     sources = []
@@ -215,6 +229,137 @@ def tokenize_batch(
     return results
 
 
+def tokenize_batch_full_mask(
+    samples: List[Dict[str, Any]],
+    tokenizer,
+    max_seq_length: int,
+) -> List[Optional[TokenizedSample]]:
+    """全 MASK 模式的批量 tokenize
+    
+    模板格式: [CLS] source [SEP] [MASK]*N [SEP]
+    Labels: source 部分 -100，[MASK]*N 部分为 target token IDs
+    """
+    valid_indices = []
+    sources = []
+    targets = []
+    sample_data = []
+    
+    for i, sample in enumerate(samples):
+        source = sample.get('source', '')
+        target = sample.get('target', '')
+        if not source or len(source) > max_seq_length - 2:
+            continue
+        
+        valid_indices.append(i)
+        sources.append(source)
+        targets.append(target)
+        sample_data.append(sample)
+    
+    if not sources:
+        return [None] * len(samples)
+    
+    # 批量 tokenize source
+    source_encodings = tokenizer(
+        sources,
+        add_special_tokens=True,
+        max_length=max_seq_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='np'
+    )
+    
+    # 批量 tokenize target (不加特殊 token)
+    target_encodings = tokenizer(
+        targets,
+        add_special_tokens=False,
+        max_length=max_seq_length,
+        padding=False,
+        truncation=True,
+        return_tensors='np'
+    )
+    
+    results = [None] * len(samples)
+    cls_id = tokenizer.cls_token_id
+    sep_id = tokenizer.sep_token_id
+    mask_id = tokenizer.mask_token_id
+    pad_id = tokenizer.pad_token_id
+    
+    for j, orig_idx in enumerate(valid_indices):
+        sample = sample_data[j]
+        source = sources[j]
+        op_labels = sample['op_labels']
+        insert_labels = sample['insert_labels']
+        
+        # 处理 Planner 标签
+        op_labels_padded = [-100] + op_labels[:max_seq_length-2] + [-100]
+        insert_labels_padded = [0] + insert_labels[:max_seq_length-2] + [0]
+        op_labels_padded = op_labels_padded + [-100] * (max_seq_length - len(op_labels_padded))
+        insert_labels_padded = insert_labels_padded + [0] * (max_seq_length - len(insert_labels_padded))
+        
+        # 计算 target 长度
+        target_length = compute_target_length(op_labels, insert_labels)
+        
+        # 获取 source tokens
+        src_input_ids = source_encodings['input_ids'][j].tolist()
+        source_tokens = [tid for tid in src_input_ids if tid not in [cls_id, sep_id, pad_id]]
+        src_len = len(source)
+        
+        # 计算可用空间
+        max_target_len = max_seq_length - src_len - 3
+        actual_target_len = min(target_length, max(0, max_target_len))
+        
+        # 构建模板: [CLS] source [SEP] [MASK]*N [SEP]
+        template_ids = [cls_id] + source_tokens[:src_len] + [sep_id]
+        target_start_pos = len(template_ids)
+        template_ids += [mask_id] * actual_target_len
+        template_ids += [sep_id]
+        
+        total_len = len(template_ids)
+        template_ids += [pad_id] * (max_seq_length - total_len)
+        template_ids = template_ids[:max_seq_length]
+        
+        # attention mask
+        template_mask = [1] * min(total_len, max_seq_length)
+        template_mask += [0] * (max_seq_length - len(template_mask))
+        template_mask = template_mask[:max_seq_length]
+        
+        # 构建 infill_labels
+        infill_labels = np.full(max_seq_length, -100, dtype=np.int16)
+        target_token_ids = target_encodings['input_ids'][j]
+        if isinstance(target_token_ids, np.ndarray):
+            target_token_ids = target_token_ids.tolist()
+        
+        for k, tid in enumerate(target_token_ids[:actual_target_len]):
+            pos = target_start_pos + k
+            if pos < max_seq_length:
+                infill_labels[pos] = tid
+        
+        results[orig_idx] = TokenizedSample(
+            input_ids=source_encodings['input_ids'][j].astype(np.int16),
+            attention_mask=source_encodings['attention_mask'][j].astype(np.int8),
+            op_labels=np.array(op_labels_padded, dtype=np.int8),
+            insert_labels=np.array(insert_labels_padded, dtype=np.int8),
+            template_input_ids=np.array(template_ids, dtype=np.int16),
+            template_attention_mask=np.array(template_mask, dtype=np.int8),
+            infill_labels=infill_labels,
+        )
+    
+    return results
+
+
+def compute_target_length(op_labels: List[int], insert_labels: List[int]) -> int:
+    """计算 target 长度"""
+    length = 0
+    for i, op in enumerate(op_labels):
+        if op == 0:  # KEEP
+            length += 1
+        elif op == 2:  # REPLACE
+            length += 1
+        if op != 1 and i < len(insert_labels):
+            length += insert_labels[i]
+    return length
+
+
 def convert_jsonl_to_tokenized_streaming(
     input_file: str,
     output_prefix: str,
@@ -223,6 +368,7 @@ def convert_jsonl_to_tokenized_streaming(
     batch_size: int = 1000,
     shuffle: bool = True,
     seed: int = 42,
+    full_mask_mode: bool = True,
 ):
     """
     流式转换 JSONL 文件为预计算 tokenize 的二进制格式
@@ -240,8 +386,11 @@ def convert_jsonl_to_tokenized_streaming(
         batch_size: 批处理大小（每批 tokenize 的样本数）
         shuffle: 是否打乱数据（需要先统计行数）
         seed: 随机种子
+        full_mask_mode: 是否使用 full MASK 模式 (True: ReLM style, False: sparse MASK)
     """
+    mode_str = "full MASK (ReLM style)" if full_mask_mode else "sparse MASK"
     print(f"Converting {input_file} to tokenized binary format (streaming mode)")
+    print(f"  MASK mode: {mode_str}")
     print(f"  Tokenizer: {tokenizer_name}")
     print(f"  Max sequence length: {max_seq_length}")
     print(f"  Batch size: {batch_size}")
@@ -302,7 +451,7 @@ def convert_jsonl_to_tokenized_streaming(
                 
                 # 批量处理
                 if len(batch) >= batch_size:
-                    results = tokenize_batch(batch, tokenizer, max_seq_length)
+                    results = tokenize_batch(batch, tokenizer, max_seq_length, full_mask_mode)
                     for result in results:
                         if result is not None:
                             writer.write_sample(result)
@@ -311,7 +460,7 @@ def convert_jsonl_to_tokenized_streaming(
         
         # 处理剩余批次
         if batch:
-            results = tokenize_batch(batch, tokenizer, max_seq_length)
+            results = tokenize_batch(batch, tokenizer, max_seq_length, full_mask_mode)
             for result in results:
                 if result is not None:
                     writer.write_sample(result)
@@ -336,7 +485,7 @@ def convert_jsonl_to_tokenized_streaming(
                 
                 # 批量处理
                 if len(batch) >= batch_size:
-                    results = tokenize_batch(batch, tokenizer, max_seq_length)
+                    results = tokenize_batch(batch, tokenizer, max_seq_length, full_mask_mode)
                     for result in results:
                         if result is not None:
                             writer.write_sample(result)
@@ -345,7 +494,7 @@ def convert_jsonl_to_tokenized_streaming(
         
         # 处理剩余批次
         if batch:
-            results = tokenize_batch(batch, tokenizer, max_seq_length)
+            results = tokenize_batch(batch, tokenizer, max_seq_length, full_mask_mode)
             for result in results:
                 if result is not None:
                     writer.write_sample(result)
@@ -386,7 +535,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子")
     
+    # MASK mode 参数
+    mask_mode_group = parser.add_mutually_exclusive_group()
+    mask_mode_group.add_argument("--full_mask_mode", action="store_true", default=True,
+                                  help="使用 full MASK 模式（ReLM 风格，模板: [CLS] src [SEP] [MASK]*N [SEP]）（默认）")
+    mask_mode_group.add_argument("--sparse_mask_mode", action="store_true",
+                                  help="使用 sparse MASK 模式（只在编辑位置放 MASK）")
+    
     args = parser.parse_args()
+    
+    # 确定 MASK 模式
+    full_mask_mode = not args.sparse_mask_mode
     
     convert_jsonl_to_tokenized_streaming(
         input_file=args.input_file,
@@ -396,6 +555,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=not args.no_shuffle,
         seed=args.seed,
+        full_mask_mode=full_mask_mode,
     )
 
 

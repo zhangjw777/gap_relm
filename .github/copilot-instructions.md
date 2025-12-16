@@ -3,7 +3,7 @@
 有时候用户的提问可能不够明确，或者缺乏必要的上下文信息。你可以通过goask主动询问用户提供更多细节，以便更好地理解需求而不产生歧义。当你完成代码后，也要使用goask来向用户提问需不需要进一步的修改。
 
 ## 项目背景
-该项目基于RELM模型,用于中文公文下的纠错。主要目的是提供F2指标。
+当前项目是基于github仓库：Claude-Liu/ReLM。This is the repo for AAAI 2024 paper Chinese Spelling Correction as Rephrasing Language Model.的一个改进版本，我以原版ReLM做baseline。
 
 ## 代码规范
 - 尽量分模块来编写代码，如果写代码时某一段逻辑比较长，请你提取为函数并命名清晰。

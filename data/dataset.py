@@ -53,7 +53,12 @@ class ModelInput:
 
 
 class GapReLMDataset(Dataset):
-    """Gap-ReLM 数据集"""
+    """Gap-ReLM 数据集
+    
+    支持两种 MASK 模式:
+    - full_mask_mode=False (稀疏 MASK): 模板中只在需要修改的位置有 [MASK]
+    - full_mask_mode=True (全 MASK): 模板格式为 [CLS] source [SEP] [MASK]*N [SEP]
+    """
     
     def __init__(
         self,
@@ -70,6 +75,7 @@ class GapReLMDataset(Dataset):
         normalize_text: bool = True,
         enable_aux_mlm: bool = True,
         aux_mlm_prob: float = 0.15,
+        full_mask_mode: bool = False,
     ):
         """
         Args:
@@ -86,6 +92,7 @@ class GapReLMDataset(Dataset):
             normalize_text: 是否规范化文本
             enable_aux_mlm: 是否启用辅助MLM
             aux_mlm_prob: 辅助MLM的mask比例
+            full_mask_mode: 是否使用全 MASK 模式
         """
         self.data_file = data_file
         self.tokenizer = tokenizer
@@ -93,6 +100,7 @@ class GapReLMDataset(Dataset):
         self.max_insert_num = max_insert_num
         self.enable_aux_mlm = enable_aux_mlm
         self.aux_mlm_prob = aux_mlm_prob
+        self.full_mask_mode = full_mask_mode
         
         # 创建预处理器
         self.preprocessor = TextPreprocessor() if normalize_text else None
@@ -389,8 +397,14 @@ class GapReLMDataset(Dataset):
         return self._convert_to_features(sample)
     
     def _convert_to_features(self, sample: ProcessedSample) -> Dict[str, Any]:
-        """将 ProcessedSample 转换为模型输入特征"""
+        """将 ProcessedSample 转换为模型输入特征
+        
+        根据 full_mask_mode 选择不同的模板构建方式:
+        - 稀疏 MASK: [CLS] template_with_sparse_masks [SEP]
+        - 全 MASK: [CLS] source [SEP] [MASK]*N [SEP]
+        """
         source = sample.source
+        target = sample.target
         
         # 1. 编码源序列
         source_encoding = self.tokenizer(
@@ -416,6 +430,25 @@ class GapReLMDataset(Dataset):
         op_labels = op_labels + [-100] * (self.max_seq_length - len(op_labels))
         insert_labels = insert_labels + [0] * (self.max_seq_length - len(insert_labels))
         
+        if self.full_mask_mode:
+            # 全 MASK 模式: 构建 [CLS] source [SEP] [MASK]*N [SEP]
+            return self._convert_to_full_mask_features(
+                sample, source_encoding, op_labels, insert_labels
+            )
+        else:
+            # 稀疏 MASK 模式（原有逻辑）
+            return self._convert_to_sparse_mask_features(
+                sample, source_encoding, op_labels, insert_labels
+            )
+    
+    def _convert_to_sparse_mask_features(
+        self,
+        sample: ProcessedSample,
+        source_encoding: Dict,
+        op_labels: List[int],
+        insert_labels: List[int],
+    ) -> Dict[str, Any]:
+        """稀疏 MASK 模式的特征转换（原有逻辑）"""
         # 3. 构建模板输入
         template_tokens = sample.gold_template.template_tokens
         template_str = ''.join(template_tokens).replace('[MASK]', self.tokenizer.mask_token)
@@ -461,9 +494,144 @@ class GapReLMDataset(Dataset):
             'infill_labels': torch.tensor(infill_labels, dtype=torch.long),
             'aux_mlm_labels': aux_mlm_labels,
             'sample_id': sample.sample_id,
-            'source_text': source,
+            'source_text': sample.source,
             'target_text': sample.target,
         }
+    
+    def _convert_to_full_mask_features(
+        self,
+        sample: ProcessedSample,
+        source_encoding: Dict,
+        op_labels: List[int],
+        insert_labels: List[int],
+    ) -> Dict[str, Any]:
+        """全 MASK 模式的特征转换
+        
+        模板格式: [CLS] source [SEP] [MASK]*N [SEP]
+        Labels: source 部分为 -100，[MASK]*N 部分为 target token IDs
+        """
+        source = sample.source
+        target = sample.target
+        
+        # 计算 target 长度 N
+        # N 由 planner labels 推导: KEEP/REPLACE 各贡献 1，DELETE 贡献 0，INSERT(k) 贡献 k
+        target_length = self._compute_target_length_from_labels(
+            sample.planner_labels.op_labels,
+            sample.planner_labels.insert_labels
+        )
+        
+        # 构建模板: [CLS] source [SEP] [MASK]*N [SEP]
+        # 计算各部分长度
+        src_len = len(source)
+        
+        # 确保不超过 max_seq_length
+        # [CLS] + src + [SEP] + N + [SEP] <= max_seq_length
+        max_target_len = self.max_seq_length - src_len - 3  # -3 for [CLS], [SEP], [SEP]
+        actual_target_len = min(target_length, max(0, max_target_len))
+        
+        # 构建 template_input_ids
+        cls_id = self.tokenizer.cls_token_id
+        sep_id = self.tokenizer.sep_token_id
+        mask_id = self.tokenizer.mask_token_id
+        pad_id = self.tokenizer.pad_token_id
+        
+        source_input_ids = source_encoding['input_ids'].squeeze(0).tolist()
+        # source_input_ids 格式: [CLS] source_tokens [SEP] [PAD]...
+        
+        # 提取 source tokens (不含 CLS、SEP、PAD)
+        source_tokens = []
+        for i, tid in enumerate(source_input_ids):
+            if tid not in [cls_id, sep_id, pad_id]:
+                source_tokens.append(tid)
+        
+        # 构建新序列: [CLS] source [SEP] [MASK]*N [SEP]
+        template_ids = [cls_id] + source_tokens[:src_len] + [sep_id]
+        target_start_pos = len(template_ids)  # [MASK] 开始位置
+        template_ids += [mask_id] * actual_target_len
+        template_ids += [sep_id]
+        
+        # Padding
+        total_len = len(template_ids)
+        pad_len = self.max_seq_length - total_len
+        template_ids += [pad_id] * max(0, pad_len)
+        template_ids = template_ids[:self.max_seq_length]  # 截断
+        
+        # 构建 attention_mask
+        template_mask = [1] * min(total_len, self.max_seq_length)
+        template_mask += [0] * max(0, self.max_seq_length - total_len)
+        template_mask = template_mask[:self.max_seq_length]
+        
+        # 构建 infill_labels: source 部分 -100，[MASK] 部分为 target token IDs
+        infill_labels = [-100] * self.max_seq_length
+        
+        # 对 target 进行 tokenize
+        target_encoding = self.tokenizer(
+            target,
+            add_special_tokens=False,
+            max_length=actual_target_len,
+            truncation=True,
+            return_tensors='pt'
+        )
+        target_token_ids = target_encoding['input_ids'].squeeze(0).tolist()
+        
+        # 填入 target labels
+        for i, tid in enumerate(target_token_ids):
+            pos = target_start_pos + i
+            if pos < self.max_seq_length:
+                infill_labels[pos] = tid
+        
+        # 5. 辅助 MLM (可选)
+        aux_mlm_labels = None
+        if self.enable_aux_mlm:
+            aux_mlm_labels = self._create_aux_mlm_labels(
+                source_encoding['input_ids'].squeeze(0),
+                sample.planner_labels.op_labels
+            )
+        
+        return {
+            'input_ids': source_encoding['input_ids'].squeeze(0),
+            'attention_mask': source_encoding['attention_mask'].squeeze(0),
+            'op_labels': torch.tensor(op_labels, dtype=torch.long),
+            'insert_labels': torch.tensor(insert_labels, dtype=torch.long),
+            'template_input_ids': torch.tensor(template_ids, dtype=torch.long),
+            'template_attention_mask': torch.tensor(template_mask, dtype=torch.long),
+            'infill_labels': torch.tensor(infill_labels, dtype=torch.long),
+            'aux_mlm_labels': aux_mlm_labels,
+            'sample_id': sample.sample_id,
+            'source_text': sample.source,
+            'target_text': sample.target,
+            # 全 MASK 模式额外信息
+            'target_start_pos': target_start_pos,
+            'target_length': actual_target_len,
+        }
+    
+    def _compute_target_length_from_labels(
+        self,
+        op_labels: List[int],
+        insert_labels: List[int],
+    ) -> int:
+        """根据 planner labels 计算 target 长度
+        
+        计算规则:
+        - KEEP (0): 贡献 1
+        - DELETE (1): 贡献 0
+        - REPLACE (2): 贡献 1
+        - INSERT: 贡献 insert_labels[i]
+        """
+        length = 0
+        for i, op in enumerate(op_labels):
+            if op == 0:  # KEEP
+                length += 1
+            elif op == 1:  # DELETE
+                pass  # 贡献 0
+            elif op == 2:  # REPLACE
+                length += 1
+            
+            # INSERT 贡献（仅对非删除位置）
+            if op != 1 and i < len(insert_labels):
+                length += insert_labels[i]
+        
+        return length
     
     def _create_aux_mlm_labels(
         self,
@@ -523,6 +691,7 @@ class LazyGapReLMDataset(Dataset):
         aux_mlm_prob: float = 0.15,
         index_cache_dir: Optional[str] = None,
         use_index_cache: bool = True,
+        full_mask_mode: bool = False,
     ):
         """
         Args:
@@ -537,6 +706,7 @@ class LazyGapReLMDataset(Dataset):
             aux_mlm_prob: 辅助MLM的mask比例
             index_cache_dir: 索引缓存目录
             use_index_cache: 是否使用/保存索引缓存
+            full_mask_mode: 是否使用全 MASK 模式
         """
         self.data_file = data_file
         self.tokenizer = tokenizer
@@ -546,6 +716,7 @@ class LazyGapReLMDataset(Dataset):
         self.enable_delete = enable_delete
         self.enable_aux_mlm = enable_aux_mlm
         self.aux_mlm_prob = aux_mlm_prob
+        self.full_mask_mode = full_mask_mode
         
         # 预处理器
         self.preprocessor = TextPreprocessor() if normalize_text else None
@@ -665,6 +836,24 @@ class LazyGapReLMDataset(Dataset):
         op_labels_padded = op_labels_padded + [-100] * (self.max_seq_length - len(op_labels_padded))
         insert_labels_padded = insert_labels_padded + [0] * (self.max_seq_length - len(insert_labels_padded))
         
+        if self.full_mask_mode:
+            # 全 MASK 模式
+            return self._build_full_mask_features(
+                source, target, op_labels, insert_labels,
+                source_encoding, op_labels_padded, insert_labels_padded, idx
+            )
+        else:
+            # 稀疏 MASK 模式（原有逻辑）
+            return self._build_sparse_mask_features(
+                source, target, data, source_encoding, 
+                op_labels_padded, insert_labels_padded, op_labels, idx
+            )
+    
+    def _build_sparse_mask_features(
+        self, source, target, data, source_encoding,
+        op_labels_padded, insert_labels_padded, op_labels, idx
+    ) -> Dict[str, Any]:
+        """稀疏 MASK 模式的特征构建（原有逻辑）"""
         # 构建模板输入
         template_tokens = data.get('template_tokens', list(source))
         template_str = ''.join(template_tokens).replace('[MASK]', self.tokenizer.mask_token)
@@ -712,6 +901,93 @@ class LazyGapReLMDataset(Dataset):
             'source_text': source,
             'target_text': target,
         }
+    
+    def _build_full_mask_features(
+        self, source, target, op_labels, insert_labels,
+        source_encoding, op_labels_padded, insert_labels_padded, idx
+    ) -> Dict[str, Any]:
+        """全 MASK 模式的特征构建"""
+        # 计算 target 长度
+        target_length = self._compute_target_length(op_labels, insert_labels)
+        
+        # 构建模板: [CLS] source [SEP] [MASK]*N [SEP]
+        src_len = len(source)
+        max_target_len = self.max_seq_length - src_len - 3
+        actual_target_len = min(target_length, max(0, max_target_len))
+        
+        cls_id = self.tokenizer.cls_token_id
+        sep_id = self.tokenizer.sep_token_id
+        mask_id = self.tokenizer.mask_token_id
+        pad_id = self.tokenizer.pad_token_id
+        
+        source_input_ids = source_encoding['input_ids'].squeeze(0).tolist()
+        source_tokens = [tid for tid in source_input_ids if tid not in [cls_id, sep_id, pad_id]]
+        
+        template_ids = [cls_id] + source_tokens[:src_len] + [sep_id]
+        target_start_pos = len(template_ids)
+        template_ids += [mask_id] * actual_target_len
+        template_ids += [sep_id]
+        
+        total_len = len(template_ids)
+        pad_len = self.max_seq_length - total_len
+        template_ids += [pad_id] * max(0, pad_len)
+        template_ids = template_ids[:self.max_seq_length]
+        
+        template_mask = [1] * min(total_len, self.max_seq_length)
+        template_mask += [0] * max(0, self.max_seq_length - total_len)
+        template_mask = template_mask[:self.max_seq_length]
+        
+        # 构建 infill_labels
+        infill_labels = [-100] * self.max_seq_length
+        target_encoding = self.tokenizer(
+            target,
+            add_special_tokens=False,
+            max_length=actual_target_len,
+            truncation=True,
+            return_tensors='pt'
+        )
+        target_token_ids = target_encoding['input_ids'].squeeze(0).tolist()
+        
+        for i, tid in enumerate(target_token_ids):
+            pos = target_start_pos + i
+            if pos < self.max_seq_length:
+                infill_labels[pos] = tid
+        
+        # 辅助 MLM
+        aux_mlm_labels = None
+        if self.enable_aux_mlm:
+            aux_mlm_labels = self._create_aux_mlm_labels(
+                source_encoding['input_ids'].squeeze(0),
+                op_labels
+            )
+        
+        return {
+            'input_ids': source_encoding['input_ids'].squeeze(0),
+            'attention_mask': source_encoding['attention_mask'].squeeze(0),
+            'op_labels': torch.tensor(op_labels_padded, dtype=torch.long),
+            'insert_labels': torch.tensor(insert_labels_padded, dtype=torch.long),
+            'template_input_ids': torch.tensor(template_ids, dtype=torch.long),
+            'template_attention_mask': torch.tensor(template_mask, dtype=torch.long),
+            'infill_labels': torch.tensor(infill_labels, dtype=torch.long),
+            'aux_mlm_labels': aux_mlm_labels,
+            'sample_id': f"lazy_{idx}",
+            'source_text': source,
+            'target_text': target,
+            'target_start_pos': target_start_pos,
+            'target_length': actual_target_len,
+        }
+    
+    def _compute_target_length(self, op_labels: List[int], insert_labels: List[int]) -> int:
+        """计算 target 长度"""
+        length = 0
+        for i, op in enumerate(op_labels):
+            if op == 0:  # KEEP
+                length += 1
+            elif op == 2:  # REPLACE
+                length += 1
+            if op != 1 and i < len(insert_labels):
+                length += insert_labels[i]
+        return length
     
     def _create_aux_mlm_labels(
         self,
@@ -881,6 +1157,8 @@ class OnlineAugmentedDataset(Dataset):
         custom_confusion_files: Optional[List[str]] = None,
         # 保护约束配置
         enable_protection: bool = True,
+        # MASK 模式
+        full_mask_mode: bool = True,
         # 其他
         seed: Optional[int] = None,
     ):
@@ -914,6 +1192,7 @@ class OnlineAugmentedDataset(Dataset):
             use_default_pinyin_confusion: 使用默认音近字混淆集
             custom_confusion_files: 自定义混淆集文件
             enable_protection: 是否启用保护约束
+            full_mask_mode: 是否使用 full MASK 模式（ReLM style）
             seed: 随机种子（用于初始化，实际训练时每个样本随机）
         """
         self.clean_sentences = clean_sentences
@@ -922,6 +1201,7 @@ class OnlineAugmentedDataset(Dataset):
         self.max_insert_num = max_insert_num
         self.enable_aux_mlm = enable_aux_mlm
         self.aux_mlm_prob = aux_mlm_prob
+        self.full_mask_mode = full_mask_mode
         
         # 预处理器
         self.preprocessor = TextPreprocessor() if normalize_text else None
@@ -1066,6 +1346,14 @@ class OnlineAugmentedDataset(Dataset):
     
     def _convert_to_features(self, sample: ProcessedSample) -> Dict[str, Any]:
         """将 ProcessedSample 转换为模型输入特征"""
+        # 根据 MASK 模式选择不同的转换方法
+        if self.full_mask_mode:
+            return self._convert_to_full_mask_features(sample)
+        else:
+            return self._convert_to_sparse_mask_features(sample)
+    
+    def _convert_to_sparse_mask_features(self, sample: ProcessedSample) -> Dict[str, Any]:
+        """将 ProcessedSample 转换为稀疏 MASK 模式的模型输入特征"""
         source = sample.source
         
         # 1. 编码源序列
@@ -1137,6 +1425,138 @@ class OnlineAugmentedDataset(Dataset):
             'source_text': source,
             'target_text': sample.target,
         }
+    
+    def _convert_to_full_mask_features(self, sample: ProcessedSample) -> Dict[str, Any]:
+        """将 ProcessedSample 转换为 full MASK 模式的模型输入特征（ReLM style）
+        
+        模板格式: [CLS] source [SEP] [MASK]*N [SEP]
+        其中 N 由 Planner 标签推断。
+        """
+        source = sample.source
+        target = sample.target
+        
+        # 1. 编码源序列
+        source_encoding = self.tokenizer(
+            source,
+            add_special_tokens=True,
+            max_length=self.max_seq_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        # 2. 处理 Planner 标签
+        op_labels_raw = sample.planner_labels.op_labels
+        insert_labels_raw = sample.planner_labels.insert_labels
+        
+        # Pad Planner 标签
+        op_labels = [-100] + op_labels_raw[:self.max_seq_length-2] + [-100]
+        insert_labels = [0] + insert_labels_raw[:self.max_seq_length-2] + [0]
+        op_labels = op_labels + [-100] * (self.max_seq_length - len(op_labels))
+        insert_labels = insert_labels + [0] * (self.max_seq_length - len(insert_labels))
+        
+        # 3. 计算 target 长度（从 Planner 标签）
+        target_length = self._compute_target_length_from_labels(op_labels_raw, insert_labels_raw)
+        
+        # 4. 编码 target（用于获取 token ids 作为标签）
+        target_encoding = self.tokenizer(
+            target,
+            add_special_tokens=False,
+            max_length=self.max_seq_length,
+            truncation=True,
+            return_tensors='pt'
+        )
+        target_token_ids = target_encoding['input_ids'].squeeze(0).tolist()
+        
+        # 5. 构建 full MASK 模板: [CLS] source [SEP] [MASK]*N [SEP]
+        cls_id = self.tokenizer.cls_token_id
+        sep_id = self.tokenizer.sep_token_id
+        mask_id = self.tokenizer.mask_token_id
+        pad_id = self.tokenizer.pad_token_id
+        
+        # 获取 source token ids（不含特殊 token）
+        source_input_ids = source_encoding['input_ids'].squeeze(0).tolist()
+        source_tokens = [tid for tid in source_input_ids if tid not in [cls_id, sep_id, pad_id]]
+        src_len = len(source)
+        
+        # 计算可用空间：max_seq_length - [CLS] - src_len - [SEP] - [SEP] = max_seq_length - src_len - 3
+        max_target_len = self.max_seq_length - src_len - 3
+        actual_target_len = min(target_length, max(0, max_target_len))
+        
+        # 构建模板
+        template_ids = [cls_id] + source_tokens[:src_len] + [sep_id]
+        target_start_pos = len(template_ids)  # [MASK] 区域的起始位置
+        template_ids += [mask_id] * actual_target_len
+        template_ids += [sep_id]
+        
+        # 填充到 max_seq_length
+        total_len = len(template_ids)
+        template_ids += [pad_id] * (self.max_seq_length - total_len)
+        template_ids = template_ids[:self.max_seq_length]
+        
+        # attention mask
+        template_mask = [1] * min(total_len, self.max_seq_length)
+        template_mask += [0] * (self.max_seq_length - len(template_mask))
+        template_mask = template_mask[:self.max_seq_length]
+        
+        # 6. 构建 Infiller 标签（target token ids 放在 MASK 位置）
+        infill_labels = [-100] * self.max_seq_length
+        for i, tid in enumerate(target_token_ids[:actual_target_len]):
+            pos = target_start_pos + i
+            if pos < self.max_seq_length:
+                infill_labels[pos] = tid
+        
+        # 7. 辅助 MLM (可选)
+        aux_mlm_labels = None
+        if self.enable_aux_mlm:
+            aux_mlm_labels = self._create_aux_mlm_labels(
+                source_encoding['input_ids'].squeeze(0),
+                op_labels_raw
+            )
+        
+        return {
+            'input_ids': source_encoding['input_ids'].squeeze(0),
+            'attention_mask': source_encoding['attention_mask'].squeeze(0),
+            'op_labels': torch.tensor(op_labels, dtype=torch.long),
+            'insert_labels': torch.tensor(insert_labels, dtype=torch.long),
+            'template_input_ids': torch.tensor(template_ids, dtype=torch.long),
+            'template_attention_mask': torch.tensor(template_mask, dtype=torch.long),
+            'infill_labels': torch.tensor(infill_labels, dtype=torch.long),
+            'aux_mlm_labels': aux_mlm_labels,
+            'sample_id': sample.sample_id,
+            'source_text': source,
+            'target_text': target,
+            # Full MASK 模式额外信息
+            'target_length': target_length,
+            'target_start_pos': target_start_pos,
+        }
+    
+    def _compute_target_length_from_labels(
+        self, 
+        op_labels: List[int], 
+        insert_labels: List[int]
+    ) -> int:
+        """从 Planner 标签计算 target 长度
+        
+        规则：
+        - KEEP (0): +1
+        - DELETE (1): +0
+        - REPLACE (2): +1
+        - INSERT: 每个位置 +insert_labels[i]（仅非 DELETE 位置）
+        """
+        length = 0
+        for i, op in enumerate(op_labels):
+            if op == 0:  # KEEP
+                length += 1
+            elif op == 2:  # REPLACE
+                length += 1
+            # DELETE (1) 贡献 0
+            
+            # INSERT: 非 DELETE 位置加上插入数量
+            if op != 1 and i < len(insert_labels):
+                length += insert_labels[i]
+        
+        return length
     
     def _create_aux_mlm_labels(
         self,

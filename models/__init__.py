@@ -3,7 +3,7 @@ from .gap_relm import GapReLMModel
 from .planner import EditPlanner
 from .infiller import ReLMInfiller
 from .verifier import Verifier
-from .template_builder import TemplateBuilder
+from .template_builder import TemplateBuilder, InferenceTemplateBuilder, FullMaskTemplateResult
 from .ptuning import PTuningEncoder, PTuningWrapper, TaskSpecificPTuning
 
 __all__ = [
@@ -12,6 +12,8 @@ __all__ = [
     "ReLMInfiller",
     "Verifier",
     "TemplateBuilder",
+    "InferenceTemplateBuilder",
+    "FullMaskTemplateResult",
     "PTuningEncoder",
     "PTuningWrapper",
     "TaskSpecificPTuning",
